@@ -1,0 +1,88 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>SENTRY</AssemblyName>
+    <RootNamespace>Sentry</RootNamespace>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- KSP's Mono runtime doesn't ship a .deps.json / runtimeconfig loader; a plain DLL next to the game's own assemblies is what it expects. -->
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+  </PropertyGroup>
+
+  <!-- DiscoveryDump.cs (a phase-1 debug tool whose motivating questions are all
+       answered) is kept for reference in archive/ but deliberately excluded from
+       the build. Project has no explicit <Compile> ItemGroup elsewhere, so the SDK's default glob
+       covers the whole project directory tree (not just src/) and would otherwise still pick this
+       up even though it's outside src/. -->
+  <ItemGroup>
+    <Compile Remove="archive/**/*.cs" />
+  </ItemGroup>
+
+  <!-- Pulls in net472 reference assemblies via NuGet so this builds without installing the old .NET Framework 4.7.2 targeting pack. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Game DLLs. Never redistribute these - Private=false keeps them out of the build output. -->
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(KSPManagedDir)Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(KSPManagedDir)UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(KSPManagedDir)UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(KSPManagedDir)UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(KSPManagedDir)UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>$(KSPManagedDir)UnityEngine.AudioModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UIModule">
+      <HintPath>$(KSPManagedDir)UnityEngine.UIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(KSPManagedDir)UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Two external mod dependencies (linuxgurugamer, LGPLv3), declared like the game DLLs above:
+       referenced from a copy in the test install, never bundled into our own output. End users
+       install these themselves - see the README/CKAN dependency list. -->
+  <ItemGroup>
+    <Reference Include="ClickThroughBlocker">
+      <HintPath>$(CTBDir)ClickThroughBlocker.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ToolbarControl">
+      <HintPath>$(ToolbarDir)ToolbarControl.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <PropertyGroup>
+    <KSPRoot>$(MSBuildProjectDirectory)\..</KSPRoot>
+    <KSPManagedDir>$(KSPRoot)\KSP_x64_Data\Managed\</KSPManagedDir>
+    <CTBDir>$(KSPRoot)\GameData\000_ClickThroughBlocker\Plugins\</CTBDir>
+    <ToolbarDir>$(KSPRoot)\GameData\001_ToolbarControl\Plugins\</ToolbarDir>
+    <OutputPath>$(KSPRoot)\GameData\SENTRY\Plugins\</OutputPath>
+  </PropertyGroup>
+
+</Project>
