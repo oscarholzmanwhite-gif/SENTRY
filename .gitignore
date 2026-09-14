@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+archive/
+*.user
+*.suo
+.vs/
+
+# Referenced game assemblies — NEVER commit
+Assembly-CSharp.dll
+Assembly-CSharp-firstpass.dll
+UnityEngine*.dll
+KSPAssets*.dll
+
+# Local paths
+*.csproj.user
+Directory.Build.props.user
+
+# OS cruft
+.DS_Store
+Thumbs.db
