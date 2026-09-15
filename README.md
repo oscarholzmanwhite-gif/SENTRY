@@ -27,7 +27,7 @@ in `GameData/Kopernicus/Config/01_DefaultConfig`
 - Copy the `SENTRY` folder to the `GameData` folder of your KSP install
 
 ## AI
-I used Claude Code for the plugin code. I'm not proficient with C# or the KSP codebase. That said, this isn't slop — human thought, planning, and testing went into this.
+I used Claude Code for the plugin code. I'm not proficient with C# or the KSP codebase. That said, this isn't slop. Human thought, planning, and testing went into this.
 
 ## License
 MIT - see [LICENSE](LICENSE)
