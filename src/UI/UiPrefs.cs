@@ -12,7 +12,7 @@ namespace Sentry.UI
     // (the game's asset database doesn't scan PluginData, so this can't collide with anything).
     public static class UiPrefs
     {
-        public enum SortMode { Time, Class }
+        public enum SortMode { Time, Class, Danger }
 
         public static bool ShowImpacts = true;
         public static bool ShowFlyBys = false;

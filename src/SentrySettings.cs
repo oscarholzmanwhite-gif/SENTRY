@@ -38,6 +38,47 @@ namespace Sentry
             minValue = 0.5f, maxValue = 24f, stepCount = 48, displayFormat = "F1", addTextField = true, unlockedDuringMission = true)]
         public float impactImminentLeadHours = 3f;
 
+        // ---- Impact consequence estimate (ImpactConsequence.cs) -----------------------------------
+        // v1 only COMPUTES and REPORTS these numbers (in the confirmed-impact alert and the
+        // AlertWindow's live estimate) - nothing here ever calls Reputation/Funds/DestructibleBuilding.
+        // These four answer "how much should this hurt, as a player preference" (a difficulty-style
+        // knob), so they live here rather than in AdvancedSettings, alongside the sliders above.
+
+        [GameParameters.CustomFloatParameterUI("Consequence: Damage Coefficient",
+            toolTip = "Overall multiplier on both the reputation and funds estimates below. 1.0 = the model's baseline.",
+            minValue = 0.1f, maxValue = 5f, stepCount = 49, displayFormat = "F1", addTextField = true, unlockedDuringMission = true)]
+        public float damageCoefficient = 1f;
+
+        [GameParameters.CustomFloatParameterUI("Consequence: Reputation Scaling",
+            toolTip = "Multiplier on the estimated reputation hit from a confirmed impact.",
+            minValue = 0.1f, maxValue = 5f, stepCount = 49, displayFormat = "F1", addTextField = true, unlockedDuringMission = true)]
+        public float reputationScaling = 1f;
+
+        [GameParameters.CustomFloatParameterUI("Consequence: Funds Scaling",
+            toolTip = "Multiplier on the facility-rebuild cost SENTRY computes internally. Not currently applied to " +
+                      "Funds: the owner chose to leave damaged buildings for the player to repair " +
+                      "themselves via the stock Space Center UI, rather than auto-deducting a cost) - kept dormant " +
+                      "in case a future pass reports or uses this figure some other way.",
+            minValue = 0.1f, maxValue = 5f, stepCount = 49, displayFormat = "F1", addTextField = true, unlockedDuringMission = true)]
+        public float fundsScaling = 1f;
+
+        [GameParameters.CustomParameterUI("Consequence: Facility Destruction",
+            toolTip = "Whether a large enough confirmed impact near KSC actually demolishes facilities (queued " +
+                      "for the next time you visit the Space Center, since buildings only exist as live objects " +
+                      "there) - you repair them yourself afterward, same as any other stock damage. No funds are " +
+                      "ever auto-deducted for this.",
+            unlockedDuringMission = true)]
+        public bool facilityDestructionEnabled = true;
+
+        [GameParameters.CustomFloatParameterUI("Consequence: Ocean Impact Modifier (%)",
+            toolTip = "How much of the land-impact reputation estimate an ocean impact carries, as a percentage.",
+            minValue = 5f, maxValue = 100f, stepCount = 20, displayFormat = "F0", addTextField = true, unlockedDuringMission = true)]
+        public float oceanImpactModifierPercent = 30f;
+
+        // No player-facing reputation-floor setting: the only floor is stock's own hard minimum,
+        // -Reputation.RepRange (-1000) - not a SENTRY-specific value, so there's nothing here to
+        // make tunable. See SentryScenario.ReportConfirmedImpact's reputation-application block.
+
         public static SentrySettings Instance
         {
             get

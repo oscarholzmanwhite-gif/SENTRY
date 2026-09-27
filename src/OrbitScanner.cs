@@ -51,11 +51,12 @@ namespace Sentry
             {
                 n++;
                 Debug.Log(string.Format(
-                    "[SENTRY]   {0} [{1}] class={2} comet={3}{4} state={5} entryUT={6:F0} impactUT={7:F0} periapsisUT={8:F0} capturePeA={9:F0}m moid={10:F0}m epoch={11:F1} ref={12} validUntil={13:F0} firstSeen={14:F0} lastEval={15:F0} lastChange={16:F0} autoTracked={17} alarmId={18} imminentAlertFired={19} lastKnownAlt={20:F0}m lastKnownSrfSpeed={21:F0}m/s captured={22} discoveryWarpStopped={23}",
+                    "[SENTRY]   {0} [{1}] class={2} comet={3}{4} state={5} entryUT={6:F0} impactUT={7:F0} periapsisUT={8:F0} capturePeA={9:F0}m moid={10:F0}m epoch={11:F1} ref={12} validUntil={13:F0} firstSeen={14:F0} lastEval={15:F0} lastChange={16:F0} autoTracked={17} alarmId={18} imminentAlertFired={19} lastKnownAlt={20:F0}m lastKnownSrfSpeed={21:F0}m/s captured={22} discoveryWarpStopped={23} isGroundImpact={24} groundImpactUT={25:F0} grazeWatchActive={26}",
                     r.Name, r.VesselId, r.ObjectClass, r.IsComet, r.IsComet ? "(" + r.CometType + ")" : "", r.State,
                     r.EntryUT, r.ImpactUT, r.PeriapsisUT, r.CapturePeA, r.Moid, r.OrbitEpoch, r.ReferenceBody,
                     r.ValidUntilUT, r.FirstSeenUT, r.LastEvaluatedUT, r.LastChangeUT, r.AutoTracked,
-                    r.AlarmId, r.ImminentAlertFired, r.LastKnownAltitude, r.LastKnownSurfaceSpeed, r.Captured, r.DiscoveryWarpStopped));
+                    r.AlarmId, r.ImminentAlertFired, r.LastKnownAltitude, r.LastKnownSurfaceSpeed, r.Captured, r.DiscoveryWarpStopped,
+                    r.IsGroundImpact, r.GroundImpactUT, r.GrazeWatchActive));
             }
             Debug.Log(string.Format("[SENTRY] ---- {0} records ----", n));
         }

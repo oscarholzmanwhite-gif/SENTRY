@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using UnityEngine;
 
 namespace Sentry
 {
@@ -26,6 +27,18 @@ namespace Sentry
         public double PeriapsisUT;
         public double CapturePeA;
         public double Moid;
+
+        // Only meaningful when State == Impact. IsGroundImpact distinguishes a genuine ground
+        // impact (CapturePeA < 0) from an atmosphere graze (0 <= CapturePeA < threshold) - both
+        // currently share ThreatState.Impact (owner's explicit choice: a grazer still belongs
+        // under the "Impacts" filter, since it has the potential to become a real impact if the
+        // player loads it and drag starts applying), but only a genuine ground impact will ever
+        // actually happen unattended. GroundImpactUT is the actual ground-crossing time - NaN for
+        // a graze, since the orbit never reaches ground level - and is what the stock Alarm Clock
+        // now targets instead of the old atmosphere-entry-based ImpactUT (see SentryScenario.
+        // ArmAlarm). See SoiIntersection.EncounterResult for the full reasoning.
+        public bool IsGroundImpact;
+        public double GroundImpactUT = double.NaN;
 
         // Comet close approach (only meaningful when State == CloseApproach; NaN otherwise):
         // the closest the comet gets to the home body and when, without entering the SOI.
@@ -79,6 +92,82 @@ namespace Sentry
         public double LastKnownAltitude = double.NaN;
         public double LastKnownSurfaceSpeed = double.NaN;
 
+        // Same transience contract as the pair above: the home-body-relative state vectors (orbit-
+        // math frame, unswizzled) and the UT they were sampled at, cached every frame alongside
+        // LastKnownAltitude/LastKnownSurfaceSpeed so ImpactConsequence can compute a real energy/
+        // location report at the moment of confirmed impact instead of just a threshold check.
+        // Deliberately NOT persisted - and deliberately not used for anything but that one-shot
+        // report, never cached/reused as a "would-be" value ahead of time.
+        public Vector3d LastKnownRelPos = new Vector3d(double.NaN, double.NaN, double.NaN);
+        public Vector3d LastKnownRelVel = new Vector3d(double.NaN, double.NaN, double.NaN);
+        public double LastKnownSampleUT = double.NaN;
+
+        // The real, per-instance generated mass (kg), captured once by briefly force-loading the
+        // vessel at the start of the impact-watch window (SentryScenario.TryCaptureRealMass) -
+        // triggers ModuleAsteroid/ModuleComet.OnStart's own procedural generation, the same real
+        // number the game itself would use, sidestepping ImpactConsequence's nominal-sphere
+        // approximation entirely. NaN until captured (or if capture failed); RealMassAttempted
+        // guards it to a one-shot attempt per record so a failure doesn't retry every frame. Neither
+        // is persisted - same transience contract as every other LastKnown* field above.
+        public double RealMassKg = double.NaN;
+        public bool RealMassAttempted;
+
+        // Latches true the first time a grazer (IsGroundImpact false) is ever observed loaded, and
+        // never turns off again - see SentryScenario.WatchImminentImpacts. A grazer has no
+        // predicted crash window at all under the naive drag-free unloaded model (it's never
+        // predicted to hit anything), but once the player loads it, real drag/heating applies and
+        // it can explode well before its predicted, drag-free periapsis - genuine evidence of an
+        // atmospheric event the model couldn't see coming. This flag is what keeps
+        // WatchImminentImpacts watching it (caching last-known telemetry) from that point on, even
+        // through the frame it later disappears and is no longer "loaded" to check. Not persisted -
+        // same transience contract as every other flag on this record; harmless to lose across a
+        // save/load, since it just means re-detecting on the next load if it's still loaded then.
+        public bool GrazeWatchActive;
+
+        // Latches true the instant this vessel is ever observed with nonzero Vessel.atmDensity
+        // while loaded (see SentryScenario.WatchImminentImpacts) - a direct readout from the
+        // game's own per-vessel FlightIntegrator, set independently of SENTRY's own orbit-based
+        // altitude sampling (which occasionally fails to get even one successful reading before a
+        // very fast destructive reentry - e.g. capturing an asteroid already mid-descent). Used as
+        // fallback evidence in ReportConfirmedImpact: if the precise LastKnownAltitude/
+        // LastKnownSurfaceSpeed telemetry never got sampled at all, "was definitely in the
+        // atmosphere at some point and never landed" is still strong grounds to treat a
+        // disappearance as a genuine impact rather than call it uncertain. Not persisted - same
+        // transience contract as every other flag here.
+        public bool WasInAtmosphere;
+
+        // Set by HandleLanded the moment this vessel is ever observed LandedOrSplashed - the "soft
+        // landing" exclusion for the WasInAtmosphere fallback above: a vessel that safely touched
+        // down is never treated as a confirmed impact later, even if it's destroyed for some
+        // unrelated reason afterward. HandleLanded already intercepts a currently-landed vessel
+        // before it can "disappear" in the first place; this flag covers the case where landing
+        // happened at some earlier point and only the later, unrelated loss reaches
+        // ReportConfirmedImpact. Not persisted - same transience contract as every other flag here.
+        public bool HasLanded;
+
+        // Set the instant a newly-spawned comet vessel's name matches the "<this comet's Name>-X"
+        // fragment-naming pattern CometManager.SpawnCometFragment uses (see
+        // SentryScenario.OnCometSpawned) - i.e. this comet has (per the decompiled
+        // Part.explode()/Die() ordering, already) broken apart under atmospheric stress rather than
+        // genuinely hit the ground. ReportConfirmedImpact checks this first: fragmenting isn't
+        // crashing, so this comet's own disappearance is reported as "broke apart," not scored as a
+        // confirmed impact - each fragment is a separate, newly-tracked object that gets its own
+        // independent evaluation instead. Not persisted - same transience contract as every other
+        // flag on this record; if a save is loaded mid-fragmentation (vanishingly unlikely - the
+        // whole sequence happens within one frame) the ordinary confirmed-impact path just applies
+        // as it would for any other comet.
+        public bool FragmentedNotImpacted;
+
+        // Set while a force-load is in flight, waiting for the part's Part.Start() coroutine to
+        // actually reach ModuleAsteroid/ModuleComet.OnStart() before Part.mass reflects the real
+        // generated value (see SentryScenario.PollRealMassCapture - this replaced an earlier,
+        // broken version that read Part.mass in the same synchronous call as Load(), which always
+        // read the part's un-started prefab default). RealMassCaptureDeadlineRealtime is a
+        // Time.realtimeSinceStartup timestamp, not persisted for the same reason as everything
+        // else on this pair of fields - meaningless across a save/load or scene change.
+        public bool RealMassCapturePending;
+        public float RealMassCaptureDeadlineRealtime;
+
         // 0 for class A, 1 for B, ... ; -1 if unknown. Used for "biggest first" sorting.
         public int ClassIndex
         {
@@ -100,6 +189,8 @@ namespace Sentry
             node.AddValue("periapsisUT", Fmt(PeriapsisUT));
             node.AddValue("capturePeA", Fmt(CapturePeA));
             node.AddValue("moid", Fmt(Moid));
+            node.AddValue("isGroundImpact", IsGroundImpact);
+            node.AddValue("groundImpactUT", Fmt(GroundImpactUT));
             node.AddValue("closestApproachUT", Fmt(ClosestApproachUT));
             node.AddValue("closestApproachDistance", Fmt(ClosestApproachDistance));
             node.AddValue("orbitEpoch", Fmt(OrbitEpoch));
@@ -136,6 +227,8 @@ namespace Sentry
             r.PeriapsisUT = ReadDouble(node, "periapsisUT");
             r.CapturePeA = ReadDouble(node, "capturePeA");
             r.Moid = ReadDouble(node, "moid");
+            node.TryGetValue("isGroundImpact", ref r.IsGroundImpact);
+            r.GroundImpactUT = ReadDouble(node, "groundImpactUT");
             r.ClosestApproachUT = ReadDouble(node, "closestApproachUT");
             r.ClosestApproachDistance = ReadDouble(node, "closestApproachDistance");
             r.OrbitEpoch = ReadDouble(node, "orbitEpoch");

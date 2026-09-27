@@ -18,6 +18,8 @@ namespace Sentry.UI
         private GUIStyle nearPassRowStyle;
         private GUIStyle approachRowStyle;
         private GUIStyle classStyle;
+        private GUIStyle dangerRepStyle;
+        private GUIStyle mildRepStyle;
         private GUIStyle rowLabelStyle;
         private GUIStyle headerStyle;
         private GUIStyle countsStyle;
@@ -36,6 +38,16 @@ namespace Sentry.UI
         private Texture2D audioIcon;
         private Texture2D alarmClockIcon;
         private Texture2D xOverlayIcon;
+        // Optional - unlike the three toggles above, a missing rescan icon isn't logged as a
+        // warning, since DrawIconToggleRow falls back to a plain text button ("Rescan") when this
+        // is null rather than showing a blank icon. Expected at GameData/SENTRY/Icons/icon_rescan.png
+        // - the other four icons in this folder are all 40x40 source PNGs (confirmed by reading
+        // their PNG headers), drawn at ToggleIconSize (36) - Unity scales a texture to fit
+        // whatever GUILayout.Width/Height it's given, so the source and draw sizes don't have to
+        // match, but 40x40 keeps this one consistent with its neighbours. Not PluginData, per the
+        // GameDatabase exclusion noted above - drop a PNG there and it's picked up with no code
+        // change.
+        private Texture2D rescanIcon;
         private bool iconsLoadAttempted;
 
         public AlertWindow() : base("SENTRY", 440f, 320f)
@@ -87,9 +99,43 @@ namespace Sentry.UI
 
             List<ThreatRecord> all = scenario.Records.Where(r => r.State != ThreatState.Ignored).ToList();
             List<ThreatRecord> shown = all.Where(PassesFilter).ToList();
-            shown = UiPrefs.Sort == UiPrefs.SortMode.Class
-                ? shown.OrderByDescending(r => r.ClassIndex).ThenBy(TimeToWatch).ToList()
-                : shown.OrderBy(TimeToWatch).ToList();
+
+            // Each shown impactor's consequence estimate, computed once per draw and reused for
+            // both "Danger" sorting and the row's own display, so an Impact-state row is never
+            // computed twice in the same frame. Still fresh every draw - this dictionary itself is
+            // rebuilt from scratch on every DrawContents call, nothing here survives past it - see
+            // ImpactConsequence's "two independent calls, nothing precomputed ahead of time" design.
+            Dictionary<Guid, ConsequenceReport> estimates = new Dictionary<Guid, ConsequenceReport>();
+            foreach (ThreatRecord r in shown)
+            {
+                // Grazers (0 <= CapturePeA < atmosphere threshold, see ThreatRecord.IsGroundImpact)
+                // get no estimate at all - showing a fake energy/rep number next to "will graze
+                // atmosphere" would contradict the disclaimer DrawRow prints for them.
+                if (r.State != ThreatState.Impact || !r.IsGroundImpact) continue;
+                if (ImpactConsequence.TryGetPredictedState(r, homeBody, out ImpactState predicted))
+                {
+                    ConsequenceReport report = ImpactConsequence.Compute(r, predicted, homeBody);
+                    if (report.Valid) estimates[r.VesselId] = report;
+                }
+            }
+
+            if (UiPrefs.Sort == UiPrefs.SortMode.Class)
+            {
+                shown = shown.OrderByDescending(r => r.ClassIndex).ThenBy(TimeToWatch).ToList();
+            }
+            else if (UiPrefs.Sort == UiPrefs.SortMode.Danger)
+            {
+                // Rows with no estimate (fly-bys, comet approaches, or an Impact row the model
+                // couldn't compute) sort to the bottom, not the top - they aren't currently a
+                // known danger, which is the least dangerous case, not the most.
+                shown = shown.OrderByDescending(r => estimates.TryGetValue(r.VesselId, out ConsequenceReport rep)
+                        ? Math.Abs(rep.WouldBeReputationDelta) : double.NegativeInfinity)
+                    .ThenBy(TimeToWatch).ToList();
+            }
+            else
+            {
+                shown = shown.OrderBy(TimeToWatch).ToList();
+            }
 
             if (shown.Count == 0)
             {
@@ -106,7 +152,9 @@ namespace Sentry.UI
                 scrollPos = GUILayout.BeginScrollView(scrollPos, GUILayout.ExpandHeight(true));
                 foreach (ThreatRecord r in shown)
                 {
-                    DrawRow(r, now, day, homeBody);
+                    ConsequenceReport? estimate = estimates.TryGetValue(r.VesselId, out ConsequenceReport rep)
+                        ? (ConsequenceReport?)rep : null;
+                    DrawRow(r, now, day, homeBody, estimate);
                 }
                 GUILayout.EndScrollView();
             }
@@ -153,7 +201,8 @@ namespace Sentry.UI
         private static readonly GUIContent[] SortOptions =
         {
             new GUIContent("Time", "Sort by time until the event"),
-            new GUIContent("Class", "Sort by object size class, biggest first (ties broken by time)")
+            new GUIContent("Class", "Sort by object size class, biggest first (ties broken by time)"),
+            new GUIContent("Danger", "Sort by estimated reputation hit, worst first (ties broken by time)")
         };
 
         private void DrawFilterRow(SentryScenario scenario)
@@ -267,6 +316,20 @@ namespace Sentry.UI
                 scenario.UseAlarmClockEnabled = !scenario.UseAlarmClockEnabled;
             }
 
+            GUILayout.Space(12f);
+
+            // A fire-once action, not a toggle - IconToggle's overlay/on-off machinery doesn't
+            // apply, so this is a plain icon button. Falls back to a text label if the owner
+            // hasn't dropped an icon file in yet (see rescanIcon's own comment for the path).
+            const string rescanTooltip = "Rescan now";
+            bool rescanClicked = rescanIcon != null
+                ? GUILayout.Button(new GUIContent(rescanIcon, rescanTooltip), GUILayout.Width(ToggleIconSize), GUILayout.Height(ToggleIconSize))
+                : GUILayout.Button(new GUIContent("Rescan", rescanTooltip));
+            if (rescanClicked)
+            {
+                scenario.RequestScan(verbose: false);
+            }
+
             GUILayout.FlexibleSpace();
             GUILayout.EndHorizontal();
         }
@@ -280,6 +343,7 @@ namespace Sentry.UI
             audioIcon = GameDatabase.Instance.GetTexture(IconBasePath + "toggle_audio", false);
             alarmClockIcon = GameDatabase.Instance.GetTexture(IconBasePath + "toggle_alarmclock", false);
             xOverlayIcon = GameDatabase.Instance.GetTexture(IconBasePath + "toggle_x", false);
+            rescanIcon = GameDatabase.Instance.GetTexture(IconBasePath + "icon_rescan", false); // optional, see field comment
 
             if (stopWarpIcon == null || audioIcon == null || alarmClockIcon == null || xOverlayIcon == null)
             {
@@ -287,14 +351,36 @@ namespace Sentry.UI
             }
         }
 
-        private void DrawRow(ThreatRecord r, double now, double day, CelestialBody homeBody)
+        // Threshold (absolute reputation points) above which the estimated rep hit in a row's
+        // class column is colored red rather than the milder default - a plain visual flag for
+        // "this one is worth paying attention to", not tied to any actual game-state clamp.
+        private const double DangerRepThreshold = 10.0;
+
+        private void DrawRow(ThreatRecord r, double now, double day, CelestialBody homeBody, ConsequenceReport? estimate)
         {
             GUIStyle rowStyle = r.State == ThreatState.Impact ? impactRowStyle
                 : r.State == ThreatState.CloseApproach ? approachRowStyle
                 : nearPassRowStyle;
             GUILayout.BeginHorizontal(rowStyle);
 
-            GUILayout.Label(string.IsNullOrEmpty(r.ObjectClass) ? "?" : r.ObjectClass, classStyle, GUILayout.Width(22f));
+            // Class letter and its estimated reputation hit sit together in their own narrow
+            // column, left of the main text block - owner's ask, so the two numbers that matter
+            // most for "how bad is this one" are readable at a glance without opening the row.
+            GUILayout.BeginVertical(GUILayout.Width(40f));
+            GUILayout.Label(string.IsNullOrEmpty(r.ObjectClass) ? "?" : r.ObjectClass, classStyle);
+            if (estimate.HasValue)
+            {
+                double repHit = Math.Abs(estimate.Value.WouldBeReputationDelta);
+                GUIStyle repStyle = repHit >= DangerRepThreshold ? dangerRepStyle : mildRepStyle;
+                // Stock KSP has no loadable reputation icon file (its star glyph is baked into a
+                // Unity sprite atlas the compiled UI uses, not a loose GameData asset) - using the
+                // Unicode star character instead, since IMGUI just renders whatever the active font
+                // supports. Unverified whether HighLogic.Skin's font actually has this glyph - if
+                // it renders as a blank box in-game, drop back to plain text and revisit with the
+                // real stock icon instead.
+                GUILayout.Label(string.Format("~{0:F0}★", repHit), repStyle);
+            }
+            GUILayout.EndVertical();
 
             string kind = r.IsComet ? "comet" : "asteroid";
             string bodyName = homeBody != null ? homeBody.name : "home";
@@ -302,8 +388,26 @@ namespace Sentry.UI
             switch (r.State)
             {
                 case ThreatState.Impact:
-                    eventText = string.Format("Impact in {0:F1} d, periapsis {1:F0} km",
-                        (r.ImpactUT - now) / day, r.CapturePeA / 1000.0);
+                    // The disclaimer is the one thing that actually distinguishes these two cases
+                    // to the player - both share ThreatState.Impact/the "Impacts" filter (owner's
+                    // choice: a grazer still has the potential to become a real impact if loaded,
+                    // since drag only applies to loaded vessels), but only a ground impact will
+                    // ever actually happen unattended (see ThreatRecord.IsGroundImpact).
+                    string disposition = r.IsGroundImpact ? "will impact surface" : "will graze atmosphere";
+                    eventText = string.Format("Impact in {0:F1} d, periapsis {1:F0} km ({2})",
+                        (r.ImpactUT - now) / day, r.CapturePeA / 1000.0, disposition);
+                    // Live estimate, computed once per draw by DrawContents (never cached across
+                    // draws) - never the same computation as the final report that fires at actual
+                    // confirmed impact (see ImpactConsequence.TryGetPredictedState vs
+                    // TryGetActualState). The rep number itself now lives in the class column
+                    // above; kt stays here since it's still useful context for this specific row.
+                    // Never populated for a grazer in the first place (see DrawContents) - showing
+                    // a fake energy estimate right next to "will graze atmosphere" would contradict
+                    // the disclaimer.
+                    if (estimate.HasValue)
+                    {
+                        eventText += string.Format("\nEst. {0:F1} kt", estimate.Value.EnergyKtTnt);
+                    }
                     break;
                 case ThreatState.CloseApproach:
                     eventText = string.Format("Approach in {0:F1} d, {1:F1} Mm",
@@ -335,12 +439,44 @@ namespace Sentry.UI
             }
         }
 
+        // The Guid this button last focused, so a later click on a different row can clean up the
+        // previous vessel's rendering state exactly the way selecting a new one does in stock code
+        // - see below.
+        private static Guid lastFocusedVesselId = Guid.Empty;
+
         private static void FocusVessel(Guid id)
         {
             Vessel v = FlightGlobals.FindVessel(id);
             if (v == null || v.mapObject == null) return;
             if (!MapView.MapIsEnabled) MapView.EnterMapView();
+
+            // PlanetariumCamera.SetTarget alone only moves the camera - it does NOT reproduce a
+            // real map-icon double-click's full trajectory line (SOI-transition/encounter markers).
+            // Confirmed by decompiling KSP.UI.Screens.SpaceTracking.SetVessel (the method a real
+            // Tracking Station row click runs): that also sets the vessel's own
+            // OrbitRenderer.isFocused and, if the object is tracked, attaches a patched-conics
+            // solver via Vessel.AttachPatchedConicsSolver() - neither of which SetTarget touches.
+            // Replicating just those two calls here (not the rest of SetVessel, which is Tracking-
+            // Station-UI-specific: widget list highlighting, button locking) is what actually turns
+            // the detailed line on.
+            if (lastFocusedVesselId != Guid.Empty && lastFocusedVesselId != id)
+            {
+                Vessel previous = FlightGlobals.FindVessel(lastFocusedVesselId);
+                if (previous != null && previous.orbitRenderer != null)
+                {
+                    previous.orbitRenderer.isFocused = false;
+                    previous.orbitRenderer.drawIcons = OrbitRendererBase.DrawIcons.OBJ;
+                    previous.DetachPatchedConicsSolver();
+                }
+            }
+
             PlanetariumCamera.fetch.SetTarget(v.mapObject);
+            if (v.orbitRenderer != null) v.orbitRenderer.isFocused = true;
+            if (v.DiscoveryInfo.HaveKnowledgeAbout(DiscoveryLevels.StateVectors) && !v.PatchedConicsAttached)
+            {
+                v.AttachPatchedConicsSolver();
+            }
+            lastFocusedVesselId = id;
         }
 
         private void EnsureStyles()
@@ -365,6 +501,12 @@ namespace Sentry.UI
 
             approachRowStyle = new GUIStyle(GUI.skin.box);
             approachRowStyle.normal.textColor = new Color(0.55f, 0.8f, 1f);
+
+            dangerRepStyle = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.UpperCenter, fontStyle = FontStyle.Bold };
+            dangerRepStyle.normal.textColor = new Color(1f, 0.3f, 0.3f);
+
+            mildRepStyle = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.UpperCenter };
+            mildRepStyle.normal.textColor = new Color(0.8f, 0.8f, 0.8f);
         }
     }
 }

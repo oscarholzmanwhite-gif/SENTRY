@@ -15,11 +15,26 @@ namespace Sentry
 
         // When the object reaches the threshold altitude (atmosphere top, or the surface for an
         // airless body). Only meaningful when IsImpact is true. This is the "impact UT" the alert
-        // state machine keys on.
+        // state machine keys on for display/lead-time purposes - NOT what the stock Alarm Clock
+        // targets (see GroundImpactUT for that).
         public double ImpactUT;
         // When the capture orbit reaches periapsis (for impacts this is a point below the
         // threshold the object never actually reaches; still useful as a sanity check).
         public double PeriapsisUT;
+
+        // True only when periapsis is actually below the ground (CapturePeA < 0), not merely below
+        // the atmosphere threshold. IsImpact alone doesn't distinguish a genuine crash from an
+        // atmosphere graze (periapsis between 0 and the atmosphere top) - and since drag is never
+        // simulated on an unloaded on-rails object, a graze truly will pass through and come back
+        // out, not crash, under this game's own physics. GroundImpactUT is the moment the orbit
+        // reaches actual ground level (home.Radius, not home.Radius + threshold) - NaN unless
+        // IsGroundImpact is true. This is what the stock Alarm Clock should target (the previous
+        // ImpactUT-based alarm fired at atmosphere entry, leaving the real remaining descent to
+        // coast by unwatched at 1x warp) and it's also the discriminator for the AlertWindow's
+        // "will impact surface" vs "will graze atmosphere" disclaimer. For an airless body,
+        // threshold is already 0, so IsGroundImpact == IsImpact and GroundImpactUT == ImpactUT.
+        public bool IsGroundImpact;
+        public double GroundImpactUT;
 
         // Diagnostics only - lets a "no encounter" verdict be sanity-checked from the log
         // instead of being a black box.
@@ -64,6 +79,7 @@ namespace Sentry
             {
                 bool escapes = astOrbit.eccentricity >= 1.0 || astOrbit.ApR > homeBody.sphereOfInfluence;
                 bool impact = astOrbit.PeA < threshold;
+                bool groundImpact = astOrbit.PeA < 0.0;
                 EncounterResult inside = new EncounterResult
                 {
                     EncounterFound = true,
@@ -71,13 +87,15 @@ namespace Sentry
                     EntryUT = startUT,
                     CapturePeA = astOrbit.PeA,
                     IsImpact = impact,
+                    IsGroundImpact = groundImpact,
                     ThresholdAltitude = threshold,
                     Note = escapes ? "already inside SOI, orbit escapes after periapsis" : "already inside SOI",
                     MoidDistance = double.NaN,
                     ClosestSampledGap = double.NaN,
                     GameTimeToPe = double.NaN,
                     ImpactUT = double.NaN,
-                    PeriapsisUT = double.NaN
+                    PeriapsisUT = double.NaN,
+                    GroundImpactUT = double.NaN
                 };
                 // Time from "now" to periapsis / threshold radius on the current orbit.
                 double rNow = astOrbit.GetRadiusAtUT(startUT);
@@ -91,6 +109,13 @@ namespace Sentry
                     double dtHit = TimeBetweenTrueAnomalies(astOrbit, homeBody, nuNow, nuHit);
                     if (dtHit < 0.0 && astOrbit.eccentricity < 1.0) dtHit += astOrbit.period;
                     inside.ImpactUT = startUT + dtHit;
+                }
+                if (groundImpact)
+                {
+                    double nuGround = -InboundTrueAnomalyAtRadius(astOrbit, homeBody.Radius);
+                    double dtGround = TimeBetweenTrueAnomalies(astOrbit, homeBody, nuNow, nuGround);
+                    if (dtGround < 0.0 && astOrbit.eccentricity < 1.0) dtGround += astOrbit.period;
+                    inside.GroundImpactUT = startUT + dtGround;
                 }
                 return inside;
             }
@@ -188,16 +213,14 @@ namespace Sentry
             double entryUT = hi;
 
             // Step 5: reconstruct the capture orbit from relative state vectors at entry.
+            Orbit captureOrbit = ReconstructCaptureOrbit(astOrbit, homeBody, entryUT);
             Vector3d relPos = astOrbit.getRelativePositionAtUT(entryUT) - homeBody.orbit.getRelativePositionAtUT(entryUT);
-            Vector3d relVel = astOrbit.getOrbitalVelocityAtUT(entryUT) - homeBody.orbit.getOrbitalVelocityAtUT(entryUT);
-
-            Orbit captureOrbit = new Orbit();
-            captureOrbit.UpdateFromStateVectors(relPos.xzy, relVel.xzy, homeBody, entryUT);
 
             // Step 6: verdict, plus timing along the capture orbit. At entry the object sits on
             // the SOI boundary heading inwards, i.e. at true anomaly -nu(R_SOI). It reaches the
             // threshold radius at -nu(R + threshold) and periapsis at 0.
             bool isImpact = captureOrbit.PeA < threshold;
+            bool isGroundImpact = captureOrbit.PeA < 0.0;
             double nuEntry = -InboundTrueAnomalyAtRadius(captureOrbit, relPos.magnitude);
             double periapsisUT = entryUT + TimeBetweenTrueAnomalies(captureOrbit, homeBody, nuEntry, 0.0);
             double impactUT = double.NaN;
@@ -206,6 +229,12 @@ namespace Sentry
                 double nuHit = -InboundTrueAnomalyAtRadius(captureOrbit, homeBody.Radius + threshold);
                 impactUT = entryUT + TimeBetweenTrueAnomalies(captureOrbit, homeBody, nuEntry, nuHit);
             }
+            double groundImpactUT = double.NaN;
+            if (isGroundImpact)
+            {
+                double nuGround = -InboundTrueAnomalyAtRadius(captureOrbit, homeBody.Radius);
+                groundImpactUT = entryUT + TimeBetweenTrueAnomalies(captureOrbit, homeBody, nuEntry, nuGround);
+            }
 
             return new EncounterResult
             {
@@ -213,14 +242,30 @@ namespace Sentry
                 EntryUT = entryUT,
                 CapturePeA = captureOrbit.PeA,
                 IsImpact = isImpact,
+                IsGroundImpact = isGroundImpact,
                 ThresholdAltitude = threshold,
                 Note = "SOI encounter found",
                 ImpactUT = impactUT,
+                GroundImpactUT = groundImpactUT,
                 PeriapsisUT = periapsisUT,
                 MoidDistance = moid,
                 ClosestSampledGap = closestGap,
                 GameTimeToPe = captureOrbit.timeToPe
             };
+        }
+
+        // Reconstructs the home-body-relative capture orbit an object is on at entryUT, from its
+        // heliocentric (or otherwise home-parent-relative) state at that instant. Factored out of
+        // Predict's own step 5 so ImpactConsequence can re-derive the same orbit (to sample state
+        // vectors at some other UT, e.g. the predicted ImpactUT) without duplicating this logic.
+        public static Orbit ReconstructCaptureOrbit(Orbit astOrbit, CelestialBody homeBody, double entryUT)
+        {
+            Vector3d relPos = astOrbit.getRelativePositionAtUT(entryUT) - homeBody.orbit.getRelativePositionAtUT(entryUT);
+            Vector3d relVel = astOrbit.getOrbitalVelocityAtUT(entryUT) - homeBody.orbit.getOrbitalVelocityAtUT(entryUT);
+
+            Orbit captureOrbit = new Orbit();
+            captureOrbit.UpdateFromStateVectors(relPos.xzy, relVel.xzy, homeBody, entryUT);
+            return captureOrbit;
         }
 
         // How far ahead a "no encounter" verdict is good for. Used by the scanner to decide when
@@ -363,10 +408,12 @@ namespace Sentry
             {
                 EncounterFound = false,
                 IsImpact = false,
+                IsGroundImpact = false,
                 ThresholdAltitude = threshold,
                 Note = note,
                 ImpactUT = double.NaN,
                 PeriapsisUT = double.NaN,
+                GroundImpactUT = double.NaN,
                 MoidDistance = double.NaN,
                 ClosestSampledGap = double.NaN,
                 GameTimeToPe = double.NaN

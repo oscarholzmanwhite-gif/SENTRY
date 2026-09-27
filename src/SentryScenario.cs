@@ -81,6 +81,20 @@ namespace Sentry
         // predicted (see AlarmClockIntegration). Default on, matching the other two toggles.
         private bool useAlarmClockEnabled = true;
 
+        // The worst facility-damage tier owed but not yet applied - set in ReportConfirmedImpact's
+        // confirmed branch, cleared once TryApplyPendingFacilityDamage actually demolishes
+        // buildings. DestructibleBuilding instances only exist as live GameObjects in the
+        // SPACECENTER scene (they're 3D scene props) - a confirmed impact almost always fires from
+        // Flight/TrackingStation instead, where there's nothing live to call .Demolish() on yet.
+        // Rather than poke ScenarioDestructibles' internal persisted ConfigNode format directly
+        // (unverified without a live repro, and risks corrupting its damage-tracking state if
+        // guessed wrong), this queues the WORST tier seen (Math.Max, since a building can only be
+        // demolished once - a second, smaller catastrophe before the first is ever applied
+        // shouldn't downgrade what's owed) and applies it the next time this scenario is actually
+        // running in SPACECENTER with buildings registered. Purely a display/flavor consequence -
+        // there is no urgency to applying it before the player can even see KSC again.
+        private ConsequenceReport.FacilityTier pendingFacilityTier = ConsequenceReport.FacilityTier.None;
+
         public IEnumerable<ThreatRecord> Records { get { return records.Values; } }
         public double LastScanUT { get { return lastScanUT; } }
         public bool ScanRunning { get { return scanRunning; } }
@@ -110,12 +124,16 @@ namespace Sentry
             SentrySettings.ApplyAbundance();
             GameEvents.OnGameSettingsApplied.Add(OnSettingsApplied);
             GameEvents.onPartCouple.Add(OnPartCouple);
+            GameEvents.onAsteroidSpawned.Add(OnAsteroidSpawned);
+            GameEvents.onCometSpawned.Add(OnCometSpawned);
         }
 
         private void OnDestroy()
         {
             GameEvents.OnGameSettingsApplied.Remove(OnSettingsApplied);
             GameEvents.onPartCouple.Remove(OnPartCouple);
+            GameEvents.onAsteroidSpawned.Remove(OnAsteroidSpawned);
+            GameEvents.onCometSpawned.Remove(OnCometSpawned);
             if (Instance == this) Instance = null;
         }
 
@@ -126,6 +144,53 @@ namespace Sentry
         private void OnSettingsApplied()
         {
             SentrySettings.ApplyAbundance();
+        }
+
+        // A brand-new untracked rock from the stock spawner (DiscoverableObjectsUtil.SpawnAsteroid,
+        // decompile-confirmed to fire this the moment the ProtoVessel is created). Requesting a scan
+        // right away - rather than waiting for the next ScanIntervalSeconds (3 game hours) tick -
+        // means it gets a ThreatRecord and a real prediction almost immediately instead of only on
+        // the next periodic scan or a manual rescan.
+        private void OnAsteroidSpawned(Vessel v)
+        {
+            RequestScan(false);
+        }
+
+        // Fires for both a fresh stock-spawned comet AND each fragment of a comet that just broke
+        // apart under atmospheric stress (DiscoverableObjectsUtil.SpawnComet, decompile-confirmed -
+        // CometManager.SpawnCometFragment calls the same method once per fragment). Same immediate-
+        // scan reasoning as OnAsteroidSpawned above - the owner reported a fragmenting comet's
+        // pieces going completely unnoticed unless the player happened to hit the manual rescan
+        // button in the few seconds before they, too, were destroyed.
+        //
+        // Also detects the fragment case specifically, by name: CometManager.SpawnCometFragment
+        // (decompiled) names each piece "<parent GetDisplayName()>-A", "-B", "-C", ... and
+        // Vessel.GetDisplayName() is just Localizer.Format(vesselName) - a no-op substitution for a
+        // plain (non-tag) string, so this is effectively matching against vesselName itself. Per the
+        // decompiled ordering in ModuleComet/Part.explode(), the parent's part.explode() -> Die()
+        // already runs BEFORE SpawnCometFragments spawns any fragment - so by the time this fires for
+        // the first fragment, the parent vessel is already gone, but its ThreatRecord is (almost
+        // certainly) still in `records`, since our own Update()/WatchImminentImpacts hasn't
+        // necessarily run yet this frame. Flagging it here, synchronously, beats that race reliably.
+        private void OnCometSpawned(Vessel v)
+        {
+            RequestScan(false);
+            if (v == null || string.IsNullOrEmpty(v.vesselName)) return;
+
+            string name = v.vesselName;
+            if (name.Length < 3 || name[name.Length - 2] != '-') return;
+            char suffix = name[name.Length - 1];
+            if (suffix < 'A' || suffix > 'Z') return;
+            string parentName = name.Substring(0, name.Length - 2);
+
+            foreach (ThreatRecord candidate in records.Values)
+            {
+                if (candidate.IsComet && candidate.Name == parentName)
+                {
+                    candidate.FragmentedNotImpacted = true;
+                    break;
+                }
+            }
         }
 
         // ---- capture (clawed asteroids) ---------------------------------------------------------
@@ -165,6 +230,14 @@ namespace Sentry
         {
             bool alreadyKnown = rec.Captured;
             rec.Captured = true;
+
+            // Synchronous, one-shot telemetry sample taken right here, at the exact moment of the
+            // grapple - not deferred to the next WatchImminentImpacts frame. A violent enough
+            // collision can destroy the merged vessel within the same frame as the couple itself,
+            // before Update() ever runs again; without this, that scenario would leave zero
+            // telemetry (not even the atmDensity fallback) and the confirmed-impact report would be
+            // missed or delayed to the next scan's coarser backstop instead of firing immediately.
+            SampleTelemetry(rec, survivor, Planetarium.GetUniversalTime(), FlightGlobals.GetHomeBody());
 
             if (survivor.id != oldId)
             {
@@ -233,11 +306,31 @@ namespace Sentry
             return false;
         }
 
-        // Part names, not part modules: unloaded objects have no modules to read. 
+        // Part names, not part modules: unloaded objects have no modules to read.
         // PotatoRoid = asteroid, PotatoComet = comet.
         private static bool IsSpaceObjectPartName(string name)
         {
             return name == "PotatoRoid" || name == "PotatoComet";
+        }
+
+        // Finds the actual asteroid/comet Part within a loaded vessel, by name rather than by
+        // index - v.parts[0] is only safe to assume for a loose space object, never for a captured
+        // (clawed) one, where the merged vessel's part order depends on which side of the couple
+        // survived (see HandleCaptured/OnPartCouple) and can just as easily put the player's own
+        // command pod at index 0. Used by real-mass capture (BeginCaptureRealMass/
+        // PollRealMassCapture and WatchImminentImpacts' "already loaded" branch) so a clawed
+        // asteroid's mass reading is never accidentally the grappling craft's instead - the owner's
+        // own decision on captured objects ("it's the same asteroid after all, only maybe a bit
+        // heavier") depends on this being right.
+        private static Part FindSpaceObjectPart(Vessel v)
+        {
+            if (v == null || v.parts == null) return null;
+            for (int i = 0; i < v.parts.Count; i++)
+            {
+                Part p = v.parts[i];
+                if (p != null && p.partInfo != null && IsSpaceObjectPartName(p.partInfo.name)) return p;
+            }
+            return null;
         }
 
         public override void OnLoad(ConfigNode node)
@@ -247,6 +340,9 @@ namespace Sentry
             node.TryGetValue("audioAlertEnabled", ref audioAlertEnabled);
             node.TryGetValue("stopWarpEnabled", ref stopWarpEnabled);
             node.TryGetValue("useAlarmClockEnabled", ref useAlarmClockEnabled);
+            int pendingFacilityTierInt = 0;
+            node.TryGetValue("pendingFacilityTier", ref pendingFacilityTierInt);
+            pendingFacilityTier = (ConsequenceReport.FacilityTier)pendingFacilityTierInt;
             foreach (ConfigNode child in node.GetNodes("THREAT"))
             {
                 ThreatRecord r = ThreatRecord.Load(child);
@@ -261,6 +357,7 @@ namespace Sentry
             node.AddValue("audioAlertEnabled", audioAlertEnabled);
             node.AddValue("stopWarpEnabled", stopWarpEnabled);
             node.AddValue("useAlarmClockEnabled", useAlarmClockEnabled);
+            node.AddValue("pendingFacilityTier", (int)pendingFacilityTier);
             foreach (ThreatRecord r in records.Values)
             {
                 r.Save(node.AddNode("THREAT"));
@@ -283,6 +380,16 @@ namespace Sentry
             {
                 abundanceApplyPending = false;
                 SentrySettings.ApplyAbundance();
+            }
+
+            // Only ever anything to do here in the Space Center scene, where DestructibleBuilding
+            // GameObjects actually exist - see pendingFacilityTier's own comment. Runs every frame
+            // while pending rather than once, since a scene can take a moment after load for every
+            // building's own OnAwake/RegisterInstance to finish.
+            if (pendingFacilityTier != ConsequenceReport.FacilityTier.None
+                && HighLogic.LoadedScene == GameScenes.SPACECENTER)
+            {
+                TryApplyPendingFacilityDamage();
             }
 
             // NOTE: deliberately not gating on FlightGlobals.ready. FlightGlobals.Vessels (the persistent vessel list, loaded with
@@ -328,10 +435,64 @@ namespace Sentry
 
             foreach (ThreatRecord rec in records.Values)
             {
-                if (rec.State != ThreatState.Impact || double.IsNaN(rec.ImpactUT)) continue;
-                if (now < rec.ImpactUT - ImpactImminentLeadSeconds) continue;
+                // A captured (clawed) object is being actively piloted, so its fate is decided by
+                // the player's own flying, not by SoiIntersection.Predict's periodic (~3 game hour)
+                // re-classification - which itself assumes a stable, unperturbed Keplerian orbit,
+                // not remotely true once real thrust or atmospheric drag is acting on a loaded
+                // vessel. A player can dive a captured asteroid into the atmosphere and destroy it
+                // within minutes, far faster than the next scan could ever reclassify rec.State as
+                // Impact - so a captured record is watched unconditionally here, regardless of its
+                // (possibly stale, possibly still NearPass/Ignored from before the dive) last-known
+                // ThreatState, purely so a sudden destructive reentry the periodic scan never had a
+                // chance to see coming still gets caught and reported the instant it happens, not
+                // missed entirely or left to HandleDisappearance's much slower per-scan backstop.
+                if (!rec.Captured)
+                {
+                    if (rec.State != ThreatState.Impact) continue;
+
+                    // A genuine predicted ground impact is watched once its fast-watch window opens,
+                    // anchored on GroundImpactUT (the real final event - see ArmAlarm). A grazer
+                    // (IsGroundImpact false) has no such window at all under the naive drag-free
+                    // unloaded model - it's never predicted to hit anything - but once the player loads
+                    // it, real drag/heating applies, and it can explode well before reaching its
+                    // predicted, drag-free periapsis.
+                    // That disappearance-within-the-atmosphere is real evidence the naive prediction
+                    // couldn't see coming, so a grazer observed loaded even once gets watched from then
+                    // on (GrazeWatchActive latches and never turns off, so the frame it later
+                    // disappears - possibly no longer "loaded" by then - still reaches the confirmed-
+                    // impact check below instead of short-circuiting here just because it unloaded/
+                    // vanished).
+                    bool groundImpactWindowOpen = rec.IsGroundImpact && !double.IsNaN(rec.GroundImpactUT)
+                        && now >= rec.GroundImpactUT - ImpactImminentLeadSeconds;
+
+                    if (!groundImpactWindowOpen && !rec.GrazeWatchActive)
+                    {
+                        Vessel candidate = FlightGlobals.FindVessel(rec.VesselId);
+                        if (candidate != null && candidate.loaded) rec.GrazeWatchActive = true;
+                        else continue;
+                    }
+                }
 
                 Vessel v = FlightGlobals.FindVessel(rec.VesselId);
+
+                // A captured (clawed) object's own space-object part can be destroyed (e.g.
+                // overheating on reentry) without destroying the whole merged vessel at all:
+                // Part.Die() (decompiled) only calls vessel.Die() when the dying part is the
+                // vessel's ROOT part. ModuleGrappleNode's couple can land root on EITHER side
+                // (see HandleCaptured) - in the branch where the ship's own vessel/part survived
+                // as root, the asteroid/comet part is just a non-root attachment, so losing it
+                // only detaches that part; the ship (same Guid) sails on untouched.
+                // FlightGlobals.FindVessel(rec.VesselId) then keeps finding a perfectly valid
+                // vessel forever, so this record would never be reported as gone at all - a real,
+                // silent miss (owner's report: "asteroid overheats while being controlled and
+                // disappears, SENTRY doesn't catch it"). HasSpaceObjectPart (already used by
+                // ScanRoutine's own much slower per-scan version of this same check) catches both
+                // this case and a deliberate release/undock (which spins the rock off as a
+                // brand-new vessel with its own Guid, rediscovered fresh next scan) - collapsing
+                // either into "gone" here is safe because ReportConfirmedImpact's own evidence
+                // checks (telemetry / WasInAtmosphere / HasLanded) already correctly read a benign
+                // release as "uncertain," never a false confirmed impact.
+                if (rec.Captured && v != null && !HasSpaceObjectPart(v)) v = null;
 
                 // A landed/splashed object has already resolved - whatever happened (a hard
                 // landing, a player-executed soft landing/redirect), it's sitting still, not
@@ -347,8 +508,10 @@ namespace Sentry
                 // the ground, deliberately or not, and doesn't need telling. The stock alarm still
                 // ramps warp down so the moment itself stays observable, and the disappearance
                 // report below still fires: that's the one that matters, since it's where the
-                // impact is actually recorded.
-                if (!rec.ImminentAlertFired && !rec.Captured)
+                // impact is actually recorded. Also suppressed for a grazer - nothing is actually
+                // "imminent" under the naive prediction; if it's genuinely about to explode, the
+                // confirmed-impact report below is what matters and fires the instant it happens.
+                if (!rec.ImminentAlertFired && !rec.Captured && rec.IsGroundImpact)
                 {
                     rec.ImminentAlertFired = true;
                     // stopWarpEligible: false - the stock Alarm Clock (armed in ApplyResult) is what
@@ -361,44 +524,40 @@ namespace Sentry
 
                 if (v != null)
                 {
-                    // Cache the last state we actually saw, every frame - the instant it disappears
-                    // we can no longer query it, so this is the only evidence available to tell a
-                    // real high-speed impact apart from the vessel being recovered, destroyed, or
-                    // successfully soft-landed by the player shortly before the predicted moment.
-                    //
-                    // Deliberately NOT Vessel.altitude/Vessel.srfSpeed: oth are only recomputed inside
-                    //  a block gated on FlightGlobals.ready, which (per the phase-3 lesson already in this file)
-                    //  is false in every scene this mod actually needs to work in except active FLIGHT
-                    //  on the object itself.
-                    //
-                    // Also NOT Orbit.GetVel() It returns velocity relative to FlightGlobals.ActiveVessel's
-                    //  own main body's frame, not relative to this orbit's own referenceBody - only correct
-                    // when called on the active vessel's own orbit (where those two bodies happen to
-                    // be the same), garbage for any other orbit, including every case that matters
-                    // here (an unpiloted asteroid; no active vessel at all in Space Center/Tracking
-                    // Station). Also not Orbit.pos/Orbit.vel or getRFrmVelOrbit (which reads Orbit.pos
-                    // internally) - both are cached fields, not guaranteed fresh for "now" on an
-                    // unloaded on-rails object between orbit-driver updates, which is exactly the
-                    // kind of staleness this project's own SOI-intersection code already avoids by
-                    // never trusting cached orbit state.
-                    //
-                    // So: reconstructed by hand from getRelativePositionAtUT(now)/
-                    // getOrbitalVelocityAtUT(now) - the same UT-explicit, metre-accurate source
-                    // SoiIntersection.cs already trusts - combined with CelestialBody.angularVelocity,
-                    // mirroring exactly what getRFrmVelOrbit computes (Cross(angularVelocity,
-                    // pos.xzy)) but from a guaranteed-fresh position instead of a possibly-stale
-                    // cached one. Only sampled once the object's orbit has actually transitioned to
-                    // home as its reference body (i.e. really is Kerbin-relative by now) - before
-                    // that, position/velocity would be relative to the Sun instead, which would be
-                    // self-consistent but meaningless as an "altitude"/"surface speed".
-                    if (home != null && v.orbit != null && v.orbit.referenceBody == home)
+                    // One-shot, at the start of the fast-watch window: force-load the vessel to
+                    // trigger ModuleAsteroid/ModuleComet.OnStart's real procedural mass generation.
+                    // Begins the load here; PollRealMassCapture (called every frame below while
+                    // pending) waits for Part.started before reading the real mass and unloading -
+                    // see that method for why a single synchronous Load-then-read doesn't work.
+                    if (!rec.RealMassAttempted)
                     {
-                        Vector3d relPos = v.orbit.getRelativePositionAtUT(now);
-                        Vector3d relVel = v.orbit.getOrbitalVelocityAtUT(now);
-                        rec.LastKnownAltitude = relPos.magnitude - home.Radius;
-                        Vector3d rotFrameVel = Vector3d.Cross(home.angularVelocity, relPos.xzy);
-                        rec.LastKnownSurfaceSpeed = (relVel.xzy - rotFrameVel).magnitude;
+                        rec.RealMassAttempted = true;
+                        Part alreadyLoadedPart = v.loaded ? FindSpaceObjectPart(v) : null;
+                        if (alreadyLoadedPart != null)
+                        {
+                            // Already loaded for some other reason (a grazer the player is flying
+                            // near, or a genuine impact - captured or not - the player happened to
+                            // be watching) - Part.Start() has necessarily already run by now, so the
+                            // real mass is available immediately with no force-load/poll dance
+                            // needed at all. Found by part name (FindSpaceObjectPart), not
+                            // v.parts[0] - a captured object's merged vessel can put the player's
+                            // own craft's part at index 0 instead.
+                            rec.RealMassKg = alreadyLoadedPart.mass * 1000.0;
+                            Debug.Log(string.Format("[SENTRY] Captured real mass for {0}: {1:F1} kg (vessel already loaded)",
+                                Describe(rec), rec.RealMassKg));
+                        }
+                        else
+                        {
+                            BeginCaptureRealMass(rec, v);
+                        }
                     }
+                    else if (rec.RealMassCapturePending)
+                    {
+                        PollRealMassCapture(rec, v);
+                    }
+
+                    SampleTelemetry(rec, v, now, home);
+
                     continue;
                 }
 
@@ -416,9 +575,166 @@ namespace Sentry
             }
         }
 
+        // Caches the last state actually observed for a still-findable vessel - the instant it
+        // disappears we can no longer query it, so this is the only evidence available to tell a
+        // real high-speed impact apart from the vessel being recovered, destroyed, or successfully
+        // soft-landed. Extracted from WatchImminentImpacts' per-frame loop so HandleCaptured can
+        // also call it synchronously, once, at the exact moment of a claw grapple - a captured
+        // vessel can in rare cases be destroyed (e.g. a violent enough collision) within the same
+        // frame as the couple itself, before WatchImminentImpacts ever gets a chance to run even
+        // once, which would otherwise leave zero telemetry (not even the atmDensity fallback) for
+        // ReportConfirmedImpact to work with and the confirmed-impact report would be missed or
+        // delayed to the next scan's much coarser backstop.
+        //
+        // Deliberately NOT Vessel.altitude/Vessel.srfSpeed: both are only recomputed inside a block
+        // gated on FlightGlobals.ready, which (per the phase-3 lesson already in this file) is
+        // false in every scene this mod actually needs to work in except active FLIGHT on the
+        // object itself.
+        //
+        // Also NOT Orbit.GetVel(): it returns velocity relative to FlightGlobals.ActiveVessel's own
+        // main body's frame, not relative to this orbit's own referenceBody - only correct when
+        // called on the active vessel's own orbit (where those two bodies happen to be the same),
+        // garbage for any other orbit, including every case that matters here (an unpiloted
+        // asteroid; no active vessel at all in Space Center/Tracking Station). Also not Orbit.pos/
+        // Orbit.vel or getRFrmVelOrbit (which reads Orbit.pos internally) - both are cached fields,
+        // not guaranteed fresh for "now" on an unloaded on-rails object between orbit-driver
+        // updates, which is exactly the kind of staleness this project's own SOI-intersection code
+        // already avoids by never trusting cached orbit state.
+        //
+        // So: reconstructed by hand from getRelativePositionAtUT(now)/getOrbitalVelocityAtUT(now) -
+        // the same UT-explicit, metre-accurate source SoiIntersection.cs already trusts - combined
+        // with CelestialBody.angularVelocity, mirroring exactly what getRFrmVelOrbit computes
+        // (Cross(angularVelocity, pos.xzy)) but from a guaranteed-fresh position instead of a
+        // possibly-stale cached one. Only sampled once the object's orbit has actually transitioned
+        // to home as its reference body (i.e. really is Kerbin-relative by now) - before that,
+        // position/velocity would be relative to the Sun instead, which would be self-consistent
+        // but meaningless as an "altitude"/"surface speed".
+        private static void SampleTelemetry(ThreatRecord rec, Vessel v, double now, CelestialBody home)
+        {
+            if (home != null && v.orbit != null && v.orbit.referenceBody == home)
+            {
+                Vector3d relPos = v.orbit.getRelativePositionAtUT(now);
+                Vector3d relVel = v.orbit.getOrbitalVelocityAtUT(now);
+                rec.LastKnownAltitude = relPos.magnitude - home.Radius;
+                Vector3d rotFrameVel = Vector3d.Cross(home.angularVelocity, relPos.xzy);
+                rec.LastKnownSurfaceSpeed = (relVel.xzy - rotFrameVel).magnitude;
+
+                // Same relPos/relVel, cached for ImpactConsequence's final report - see
+                // ThreatRecord.LastKnownRelPos/RelVel/SampleUT.
+                rec.LastKnownRelPos = relPos;
+                rec.LastKnownRelVel = relVel;
+                rec.LastKnownSampleUT = now;
+            }
+
+            // Independent fallback evidence, deliberately NOT gated on the same
+            // v.orbit.referenceBody == home condition as the block above (or on that block
+            // succeeding at all) - Vessel.atmDensity is set every physics tick by this vessel's own
+            // FlightIntegrator (confirmed by decompiling it), for any loaded vessel, independent of
+            // SENTRY's own orbit math. A destructive reentry can apparently sometimes outrun our
+            // own per-frame sampling above (e.g. capturing an asteroid already mid-descent,
+            // destroyed before a single successful LastKnownAltitude reading) - this is what lets
+            // ReportConfirmedImpact still treat that as a confirmed impact instead of "no recent
+            // sample" uncertainty.
+            if (v.atmDensity > 0.0) rec.WasInAtmosphere = true;
+        }
+
         private static double ThresholdAltitude(CelestialBody home)
         {
             return home != null && home.atmosphere ? home.atmosphereDepth : 0.0;
+        }
+
+        // Force-loads an unloaded vessel so its part's PartModules will (eventually) run OnStart() -
+        // which is where ModuleAsteroid/ModuleComet actually generate the object's real procedural
+        // mesh and compute its exact mass (asteroidMass = paGenerated.volume * density, confirmed by
+        // decompiling both modules). Vessel.Load()/Unload() are the same pair the game itself uses
+        // whenever a vessel enters/leaves physics range (Unload() rebuilds a fresh ProtoVessel
+        // snapshot before tearing the loaded parts down, confirmed by decompiling it), so this is a
+        // well-trodden, safe operation - not something invented for this feature. Deliberately a
+        // no-op if the vessel is already loaded (never force-unloads something that has a real
+        // reason to be loaded, e.g. the active vessel or something the player is otherwise near).
+        //
+        // Does NOT read the mass here. An earlier version did - v.Load() then immediately
+        // v.parts[0].mass in the same call - and always read exactly 150000.0 kg, class A/C/D
+        // alike (150 t, KSP.log-confirmed): Part.Start() is decompiled to `private IEnumerator
+        // Start()`, a Unity coroutine, and ModulesOnStart() (which triggers the real mass
+        // generation) runs partway through it, not synchronously when Load() returns. Reading
+        // Part.mass immediately after Load() reads the still-un-started prefab default every time.
+        // PollRealMassCapture (called every frame this stays pending) waits for Part.started before
+        // reading the real value.
+        private static void BeginCaptureRealMass(ThreatRecord rec, Vessel v)
+        {
+            if (v.loaded) return;
+            try
+            {
+                v.Load();
+                rec.RealMassCapturePending = true;
+                rec.RealMassCaptureDeadlineRealtime = Time.realtimeSinceStartup + AdvancedSettings.RealMassCaptureTimeoutSeconds;
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[SENTRY] Failed to force-load " + Describe(rec) + " for real mass: " + e.Message);
+                if (v.loaded) v.Unload();
+            }
+        }
+
+        // Polls every frame (from WatchImminentImpacts) while a real-mass capture is in flight.
+        // Reads the real mass once it's actually available, or gives up and unloads anyway once
+        // RealMassCaptureTimeoutSeconds elapses, falling back to ImpactConsequence's nominal-class
+        // estimate (RealMassKg stays NaN).
+        //
+        // Ready signal is "has Part.mass moved off this part's own static prefab default", NOT
+        // Part.started - found after the owner reported the timeout warning firing
+        // repeatedly for a captured comet. Decompiling Part.Start()'s coroutine settled it:
+        // ModulesOnStart() (which is where ModuleAsteroid/ModuleComet actually write the real
+        // generated mass, synchronously - asteroidMass/cometMass = volume * density) runs early,
+        // but started=true isn't set until several `yield return null`s and a full rigidbody/
+        // CreateAttachJoint pass LATER in that same coroutine - work that has nothing to do with
+        // mass and, for a merged (captured/clawed) multi-part vessel specifically, plausibly takes
+        // longer or gets redone around the couple's own joint rebuild. Part.started was a
+        // plausible-sounding name for "has this part's mass been generated," not what it actually
+        // gates on - the same trap this project has hit before with Orbit.GetVel()/
+        // FlightGlobals.ready (see Toolchain notes). Checking the mass field directly is immune to
+        // however long that unrelated physics setup takes.
+        private static void PollRealMassCapture(ThreatRecord rec, Vessel v)
+        {
+            if (v == null || !v.loaded)
+            {
+                // Vanished or was unloaded by something else while we waited - nothing to finish.
+                rec.RealMassCapturePending = false;
+                return;
+            }
+
+            // Found by part name (FindSpaceObjectPart), not v.parts[0] - a captured object's merged
+            // vessel can put the player's own craft's part at index 0 instead (see that method).
+            Part spaceObjectPart = FindSpaceObjectPart(v);
+            bool massGenerated = spaceObjectPart != null && spaceObjectPart.partInfo != null
+                && spaceObjectPart.partInfo.partPrefab != null
+                && spaceObjectPart.mass != spaceObjectPart.partInfo.partPrefab.mass;
+            bool massReady = spaceObjectPart != null && (massGenerated || spaceObjectPart.started);
+            bool timedOut = Time.realtimeSinceStartup >= rec.RealMassCaptureDeadlineRealtime;
+            if (!massReady && !timedOut) return; // keep waiting, still within budget
+
+            try
+            {
+                if (massReady)
+                {
+                    // Part.mass is in tonnes (KSP's universal mass unit) - convert to kg, same as
+                    // ImpactConsequence's own nominal-mass calculation.
+                    rec.RealMassKg = spaceObjectPart.mass * 1000.0;
+                    Debug.Log(string.Format("[SENTRY] Captured real mass for {0}: {1:F1} kg (forced load, mass generated)",
+                        Describe(rec), rec.RealMassKg));
+                }
+                else
+                {
+                    Debug.LogWarning("[SENTRY] Real mass capture timed out for " + Describe(rec) +
+                        " - part never finished starting; falling back to the nominal-class estimate.");
+                }
+            }
+            finally
+            {
+                rec.RealMassCapturePending = false;
+                if (v.loaded) v.Unload();
+            }
         }
 
         // Classifies a disappearing impactor using the last altitude/surface-speed we actually
@@ -433,6 +749,20 @@ namespace Sentry
         private void ReportConfirmedImpact(ThreatRecord rec, CelestialBody home)
         {
             string homeName = home != null ? home.name : "the home body";
+
+            // Set by OnCometSpawned the moment a fragment bearing this comet's name+suffix pattern
+            // is spawned - which, per the decompiled Part.explode()/Die() ordering, means THIS
+            // comet's own destruction already happened as a side effect of breaking apart, not a
+            // genuine ground impact. Reporting it as a confirmed impact here too would double-count
+            // the same physical event: once for "the comet we were tracking vanished," and again for
+            // whatever each fragment - now its own independently-tracked record - eventually does.
+            if (rec.FragmentedNotImpacted)
+            {
+                AlertLog.Notice(Localizer.Format("#SENTRY_title_cometFragmented"),
+                    Localizer.Format("#SENTRY_msg_cometFragmented", Describe(rec), homeName));
+                return;
+            }
+
             double threshold = ThresholdAltitude(home);
             // Small slack above the threshold: the last sample was taken up to one frame before
             // the actual deletion, so it can read a touch high even for a genuine impact.
@@ -440,12 +770,124 @@ namespace Sentry
                 && rec.LastKnownAltitude <= threshold + Math.Max(threshold * 0.05, 100.0);
             bool fastEnough = !double.IsNaN(rec.LastKnownSurfaceSpeed)
                 && rec.LastKnownSurfaceSpeed >= AdvancedSettings.ImpactSurfaceSpeedCutoffMs;
+            bool confirmedByTelemetry = nearSurface && fastEnough;
 
-            if (nearSurface && fastEnough)
+            // Fallback for when WatchImminentImpacts' own orbit-based sampling never got a single
+            // successful reading before the vessel disappeared (owner's report: "no recent
+            // altitude sample" firing even when the asteroid demonstrably blew up while loaded -
+            // a genuinely fast destructive reentry, e.g. capturing something already mid-descent,
+            // can apparently sometimes outrun that per-frame sampling entirely). WasInAtmosphere is
+            // set independently, from Vessel.atmDensity (the game's own per-vessel aero
+            // simulation), so it doesn't share whatever's causing the orbit-based reading to miss.
+            // !rec.HasLanded is the "soft landing" exclusion the owner explicitly asked for - a
+            // vessel that safely touched down at any point is never treated as an impact here, even
+            // under this fallback.
+            bool confirmedByFallback = !confirmedByTelemetry && !rec.HasLanded && rec.WasInAtmosphere;
+
+            if (confirmedByTelemetry || confirmedByFallback)
             {
-                AlertLog.Alert(Localizer.Format("#SENTRY_title_impact"),
-                    Localizer.Format("#SENTRY_msg_impactConfirmed",
-                        Describe(rec), homeName, rec.ImpactUT.ToString("F0"), rec.LastKnownAltitude.ToString("F0"), rec.LastKnownSurfaceSpeed.ToString("F0")),
+                string message = confirmedByTelemetry
+                    ? Localizer.Format("#SENTRY_msg_impactConfirmed",
+                        Describe(rec), homeName, rec.ImpactUT.ToString("F0"), rec.LastKnownAltitude.ToString("F0"), rec.LastKnownSurfaceSpeed.ToString("F0"))
+                    : Localizer.Format("#SENTRY_msg_impactConfirmedFallback", Describe(rec), homeName);
+
+                // Folds the consequence estimate into the alert that already exists - only in the
+                // confirmed branch, never for an "uncertain" outcome, since we don't actually know
+                // an impact happened there. Reputation is now genuinely applied here - Funds/DestructibleBuilding are still never touched, the
+                // Prefers the precise last-known telemetry (TryGetActualState); if that's exactly
+                // what's missing (the fallback branch), falls back to the last predicted state
+                // instead of skipping the report entirely - an approximation, but still a real
+                // energy/burst/reputation analysis rather than nothing.
+                bool haveState = ImpactConsequence.TryGetActualState(rec, out ImpactState finalState);
+                if (!haveState) haveState = ImpactConsequence.TryGetPredictedState(rec, home, out finalState);
+
+                if (haveState)
+                {
+                    ConsequenceReport report = ImpactConsequence.Compute(rec, finalState, home);
+                    if (report.Valid)
+                    {
+                        string surfaceDesc = report.IsOcean
+                            ? Localizer.Format("#SENTRY_frag_ocean")
+                            : Localizer.Format("#SENTRY_frag_land");
+                        message += "\n" + Localizer.Format("#SENTRY_frag_consequenceReport",
+                            report.EnergyKtTnt.ToString("F1"),
+                            DescribeBurst(report),
+                            surfaceDesc,
+                            report.LatitudeDeg.ToString("F1"),
+                            report.LongitudeDeg.ToString("F1"),
+                            (report.LeadTimeSeconds / 86400.0).ToString("F1"),
+                            Math.Abs(report.WouldBeReputationDelta).ToString("F0"));
+                        if (report.FacilityWouldBeDamaged)
+                        {
+                            // No funds figure quoted here (see the facility-application block
+                            // below) - the actual repair cost is whatever stock's own
+                            // DestructibleBuilding.RepairCost says, not our own estimate.
+                            message += " " + Localizer.Format("#SENTRY_frag_facilityDamage");
+                        }
+
+                        bool isCareer = HighLogic.CurrentGame != null && HighLogic.CurrentGame.Mode == Game.Modes.CAREER;
+
+                        if (isCareer && Reputation.Instance != null)
+                        {
+                            // This is NOT a softer,
+                            // SENTRY-specific limit above that - a single bad enough chain of
+                            // impacts (e.g. several comet fragments each scoring their own impact)
+                            // CAN and should be able to take a player from max reputation straight
+                            // to -1000. The reason this still needs code at all, rather than just
+                            // calling AddReputation directly and trusting stock to clamp it: stock's
+                            // own AddReputation (decompiled: addReputation_granular) has NO clamp of
+                            // its own - only a diminishing-returns curve per increment, which
+                            // throttles how much a SINGLE large call can move rep but does nothing
+                            // to stop a SEQUENCE of separate calls from drifting past -1000
+                            // altogether. Pre-capping the REQUESTED delta to the remaining budget
+                            // above -1000, before ever calling AddReputation, reproduces
+                            // SetReputation's own floor without SetReputation's other problem (it
+                            // re-clamps the SET value to [-1000,1000], which is exactly why an
+                            // earlier attempt at a LOWER custom floor via SetReputation didn't work -
+                            // moot now that the floor is -1000, the same value SetReputation itself
+                            // would clamp to, but AddReputation's delta is still what actually needs
+                            // capping here).
+                            float floor = -Reputation.RepRange;
+                            float remainingBudget = Reputation.CurrentRep - floor; // how far above -1000 we are right now
+                            float delta = (float)report.WouldBeReputationDelta;
+                            if (remainingBudget <= 0f) delta = 0f; // already at/below the floor - fully absorbed
+                            else if (-delta > remainingBudget) delta = -remainingBudget;
+
+                            if (delta != 0f)
+                            {
+                                Reputation.Instance.AddReputation(delta, TransactionReasons.None);
+                            }
+                            Debug.Log(string.Format("[SENTRY] Applied reputation penalty {0:F1} (requested {1:F1}) for {2}. New total: {3:F1}",
+                                delta, report.WouldBeReputationDelta, Describe(rec), Reputation.CurrentRep));
+                        }
+
+                        // Facility application - gated on career mode only, independent of
+                        // Reputation.Instance (this shouldn't silently no-op just because
+                        // reputation happened to be unavailable). No automatic Funding deduction here at all - buildings are
+                        // left genuinely destroyed (queued for demolition, see
+                        // pendingFacilityTier's own comment, since DestructibleBuilding doesn't
+                        // exist as a live GameObject outside the Space Center scene) for the
+                        // player to repair themselves via the stock Space Center repair UI, on
+                        // their own timeline. This deliberately lets a player defer or skip
+                        // repairing a nonessential facility (Spaceplane Hangar, Administration)
+                        // rather than being charged a lump sum they didn't choose, and reads more
+                        // dramatically than a funds line in a screen message ever could -
+                        // ImpactConsequence.Compute still computes WouldBeFundsDelta (harmless,
+                        // unused, same "computed fact nothing reads" pattern already accepted for
+                        // BypassesFloor) but nothing applies or reports it anymore.
+                        if (isCareer && report.FacilityWouldBeDamaged)
+                        {
+                            if (report.FacilityDamageTier > pendingFacilityTier)
+                            {
+                                pendingFacilityTier = report.FacilityDamageTier;
+                            }
+                            Debug.Log(string.Format("[SENTRY] Facility damage from {0}: tier {1}. Demolition queued for next Space Center visit - repair left to the player.",
+                                Describe(rec), report.FacilityDamageTier));
+                        }
+                    }
+                }
+
+                AlertLog.Alert(Localizer.Format("#SENTRY_title_impact"), message,
                     severe: true, stopWarpEligible: false);
             }
             else
@@ -468,7 +910,12 @@ namespace Sentry
         // was flickering into spurious fresh "Impact predicted" alerts.
         private void HandleLanded(ThreatRecord rec, Vessel v, double now, CelestialBody homeBody)
         {
-            if (rec == null || rec.State == ThreatState.Ignored) return; // never was a threat, or already resolved
+            if (rec == null) return;
+            // Unconditional, even if we're about to early-return below (already resolved) - the
+            // "soft landing" fact itself needs to stick regardless of whether this specific call
+            // does anything else, see ReportConfirmedImpact's WasInAtmosphere fallback.
+            rec.HasLanded = true;
+            if (rec.State == ThreatState.Ignored) return; // never was a threat, or already resolved
 
             ThreatState oldState = rec.State;
             if (oldState == ThreatState.Impact) DisarmAlarm(rec);
@@ -684,6 +1131,8 @@ namespace Sentry
             rec.PeriapsisUT = result.PeriapsisUT;
             rec.CapturePeA = result.CapturePeA;
             rec.Moid = result.MoidDistance;
+            rec.IsGroundImpact = result.IsGroundImpact;
+            rec.GroundImpactUT = result.GroundImpactUT;
             rec.ClosestApproachDistance = approachDist;
             rec.ClosestApproachUT = approachUT;
             rec.OrbitEpoch = v.orbit.epoch;
@@ -733,19 +1182,38 @@ namespace Sentry
 
             string label = Describe(rec);
 
+            // Keeps the stock Alarm Clock entry in sync with the current graze-vs-ground-impact
+            // classification, independent of whether ThreatState itself just changed - a periapsis
+            // refinement can flip IsGroundImpact while staying in ThreatState.Impact the whole
+            // time (both share that one state - see ThreatRecord.IsGroundImpact), and that flip
+            // needs the same arm/disarm response a full state transition would get. Runs on every
+            // call, not just on transition, and is idempotent either way (ArmAlarm/DisarmAlarm are
+            // both safe to call repeatedly). Only a genuine ground impact (CapturePeA < 0) ever
+            // gets an alarm - an atmosphere graze can't actually happen unattended (no drag is
+            // simulated on an unloaded object, so it will pass through and come back out), so
+            // there's nothing there for a forced warp-stop to protect.
+            if (newState == ThreatState.Impact || oldState == ThreatState.Impact)
+            {
+                if (newState == ThreatState.Impact && rec.IsGroundImpact)
+                {
+                    if (rec.AlarmId == 0 || !AlarmClockIntegration.IsArmed(rec.AlarmId))
+                    {
+                        ArmAlarm(rec, v, homeBody); // applies to captured objects too - see below
+                    }
+                    else
+                    {
+                        AlarmClockIntegration.UpdateAlarmUT(rec.AlarmId, rec.GroundImpactUT);
+                    }
+                }
+                else
+                {
+                    DisarmAlarm(rec);
+                }
+            }
+
             if (newState != oldState)
             {
                 rec.LastChangeUT = now;
-                // Leaving Impact for any other state means the alarm clock entry (if any) is no
-                // longer wanted - do this once here rather than in every case below.
-                if (oldState == ThreatState.Impact) DisarmAlarm(rec);
-
-                // Arming the stock alarm happens regardless of whether the object is captured.
-                // It's silent (no native popup or sound - see AlarmClockIntegration), and its only
-                // real job is ramping warp down so the impact moment can't be skipped clean over at
-                // high warp. The phase-6 consequence depends on actually observing that moment, so
-                // a clawed asteroid needs this just as much as a loose one does.
-                if (newState == ThreatState.Impact) ArmAlarm(rec, v, homeBody);
 
                 // A captured object is one the player is personally flying - they already know far
                 // more about it than an alert could tell them, and a forced warp stop mid-burn
@@ -820,9 +1288,10 @@ namespace Sentry
                         Localizer.Format("#SENTRY_msg_impactRevised", label, When(rec.ImpactUT, now, homeBody), oldImpactUT.ToString("F0"), (rec.ImpactUT - oldImpactUT).ToString("+0;-0")),
                         severe: true, stopWarpEligible: false);
                 }
-                // Alarm UT is resynced either way: a captured object's impact time shifts constantly
-                // while the player manoeuvres it, and the alarm is what keeps the moment observable.
-                AlarmClockIntegration.UpdateAlarmUT(rec.AlarmId, rec.ImpactUT);
+                // No AlarmClockIntegration call needed here anymore - the unified alarm-sync block
+                // above already re-synced a ground impact's alarm to the current GroundImpactUT (or
+                // armed/disarmed it, if the graze/ground classification itself changed) earlier in
+                // this same call, unconditionally, before this revision check ever runs.
             }
 
             // The "Impact imminent" reminder and the "confirmed by disappearance" alert are both
@@ -848,8 +1317,28 @@ namespace Sentry
             // whatever last-known altitude/speed sample is available (usually none here, since
             // this backstop path is for records that disappeared before ever entering
             // WatchImminentImpacts' fast-watch window - it degrades gracefully to "uncertain" in
-            // that case, which is honest: we don't have the evidence either way).
-            if (rec.State == ThreatState.Impact && !double.IsNaN(rec.ImpactUT) && now >= rec.ImpactUT - ScanIntervalSeconds)
+            // that case, which is honest: we don't have the evidence either way). Same story for
+            // ImpactConsequence's report fragment inside ReportConfirmedImpact: no last-known state
+            // vectors means no report, an accepted gap rather than a bug - the fast-watch window
+            // covers the overwhelming majority of real confirmations.
+            //
+            // Not gated on IsGroundImpact/GroundImpactUT here - a grazer that disappears is exactly
+            // as reportable as a genuine ground impact, since ReportConfirmedImpact's own
+            // altitude/speed evidence check (not this one) is what actually decides "within the
+            // atmosphere = impact, use the airburst analysis" vs. "no evidence = uncertain," per
+            // the owner's own rule. A grazer that vanishes with no cached telemetry at all (never
+            // loaded, so WatchImminentImpacts never got a look at it) has no evidence either way
+            // and correctly falls into that method's "uncertain" branch on its own.
+            //
+            // Also admits rec.Captured regardless of State, as a defensive backstop mirroring
+            // WatchImminentImpacts' own unconditional-for-captured-objects watch - a captured
+            // object's ThreatState can be stale (still NearPass/Ignored from before the player
+            // dove it into the atmosphere) since the periodic scan's Keplerian-orbit prediction
+            // doesn't track active piloting. WatchImminentImpacts should normally catch this first
+            // (same frame it happens - see that method for why "immediately" matters here), this is
+            // only for the rare case it never got a chance to (e.g. destroyed before ever being
+            // iterated by Update()).
+            if (rec.State == ThreatState.Impact || rec.Captured)
             {
                 ReportConfirmedImpact(rec, homeBody);
             }
@@ -929,9 +1418,15 @@ namespace Sentry
         private void ArmAlarm(ThreatRecord rec, Vessel v, CelestialBody homeBody)
         {
             if (!useAlarmClockEnabled || AlarmClockIntegration.IsArmed(rec.AlarmId)) return;
+            // Targets GroundImpactUT (the actual ground-crossing moment), not the old atmosphere-
+            // entry ImpactUT - drag isn't simulated on an unloaded object, so the previous alarm
+            // fired at atmosphere entry and left the whole remaining descent to coast by at 1x warp
+            // with nothing else forcing a stop. Only ever called for a genuine ground impact (see
+            // the caller in ApplyResult) - GroundImpactUT is NaN for an atmosphere graze, which
+            // can't actually happen unattended anyway.
             string title = string.Format("{0} impact", rec.Name);
             string description = string.Format("SENTRY: {0} predicted to impact {1}.", Describe(rec), homeBody.name);
-            rec.AlarmId = AlarmClockIntegration.CreateAlarm(v, title, description, rec.ImpactUT);
+            rec.AlarmId = AlarmClockIntegration.CreateAlarm(v, title, description, rec.GroundImpactUT);
         }
 
         // Idempotent: safe to call even if no alarm is currently armed.
@@ -953,7 +1448,8 @@ namespace Sentry
                 if (homeBody == null) return;
                 foreach (ThreatRecord rec in records.Values)
                 {
-                    if (rec.State != ThreatState.Impact || rec.AlarmId != 0) continue;
+                    // Only a genuine ground impact ever gets an alarm - see ArmAlarm's own comment.
+                    if (rec.State != ThreatState.Impact || !rec.IsGroundImpact || rec.AlarmId != 0) continue;
                     Vessel v = FlightGlobals.FindVessel(rec.VesselId);
                     if (v == null) continue;
                     ArmAlarm(rec, v, homeBody);
@@ -963,6 +1459,93 @@ namespace Sentry
             {
                 foreach (ThreatRecord rec in records.Values) DisarmAlarm(rec);
             }
+        }
+
+        // ---- facility destruction (KSC building demolition) -------------------------------------
+
+        // Non-persisted (reset every scene load in OnAwake - see there) - tracks how long
+        // ScenarioDestructibles.facilityToDestructibles' entry count has held steady, so
+        // TryApplyPendingFacilityDamage doesn't act on a registry that's still mid-populating.
+        private int facilityCountLastSeen = -1;
+        private float facilityCountStableSinceRealtime = -1f;
+
+        // Applies whatever facility-damage tier is owed (see pendingFacilityTier's own comment) by
+        // demolishing live DestructibleBuilding instances - only ever meaningful from the Space
+        // Center scene, where ScenarioDestructibles.facilityToDestructibles holds real, registered
+        // buildings.        
+        // `RegisterInstance()` is called from `Start()`/`OnEnable()`, not `Awake()`, and each
+        // building's own `OnDisable()`/`OnEnable()` pair (`needsResetOnReEnable`) re-registers on
+        // re-enable - consistent with KSC buildings coming in and out of camera/LOD range
+        // dynamically, not all registering in one guaranteed batch the moment the scene loads.
+        // Acting on the very first non-empty read caught only whatever happened to already be in
+        // view that frame, then unconditionally cleared the pending flag regardless of how many
+        // were actually found - which silently gave up early on a normal in-session scene switch
+        // (fast, little settle time) far more often than on a full restart (slower to reach that
+        // first check, so more buildings had already registered by then) - explaining exactly the
+        // asymmetry reported. Fix: wait for the registered count to hold steady for
+        // AdvancedSettings.FacilityRegistrationSettleSeconds before acting at all.
+        //
+        // "Single"/"Several"/"Levelled" map to 1 / AdvancedSettings.FacilitySeveralBuildingCount /
+        // every registered facility - deliberately not targeted at the actual impact site
+        // specifically (that would need an absolute world-position conversion this project has
+        // consistently avoided elsewhere for floating-origin reasons - see the Toolchain notes) -
+        // an accepted simplification for a feature meant to be exceedingly rare in the first place
+        // (per the design doc, "practically impossible" from a random impact - this only
+        // realistically fires from a deliberate player-steered catastrophe). Since only whatever
+        // happens to be registered after settling gets considered, "Levelled" still isn't a
+        // guarantee of literally every KSC building either - the same already-accepted trade-off,
+        // just no longer dependent on exactly which frame this method first got lucky enough to run on.
+        private void TryApplyPendingFacilityDamage()
+        {
+            int currentCount = ScenarioDestructibles.facilityToDestructibles != null
+                ? ScenarioDestructibles.facilityToDestructibles.Count : 0;
+
+            if (currentCount != facilityCountLastSeen)
+            {
+                facilityCountLastSeen = currentCount;
+                facilityCountStableSinceRealtime = Time.realtimeSinceStartup;
+                return; // still changing (or just started) - keep waiting
+            }
+
+            if (currentCount == 0) return; // nothing registered at all yet - keep waiting
+
+            if (Time.realtimeSinceStartup - facilityCountStableSinceRealtime
+                < AdvancedSettings.FacilityRegistrationSettleSeconds)
+            {
+                return; // count is non-zero but hasn't held steady long enough yet - keep waiting
+            }
+
+            int wantCount = pendingFacilityTier == ConsequenceReport.FacilityTier.Levelled
+                ? int.MaxValue
+                : (pendingFacilityTier == ConsequenceReport.FacilityTier.Several
+                    ? AdvancedSettings.FacilitySeveralBuildingCount
+                    : 1);
+
+            int demolished = 0;
+            foreach (KeyValuePair<string, List<ScenarioDestructibles.ProtoDestructible>> facility in ScenarioDestructibles.facilityToDestructibles)
+            {
+                if (demolished >= wantCount) break;
+
+                // A facility with nothing left intact (already destroyed by an earlier event)
+                // doesn't count toward wantCount - move on to a fresh one instead.
+                bool anyIntactHere = false;
+                foreach (ScenarioDestructibles.ProtoDestructible proto in facility.Value)
+                {
+                    foreach (DestructibleBuilding building in proto.dBuildingRefs)
+                    {
+                        if (building != null && building.IsIntact && !building.IsDestroyed)
+                        {
+                            building.Demolish();
+                            anyIntactHere = true;
+                        }
+                    }
+                }
+                if (anyIntactHere) demolished++;
+            }
+
+            AlertLog.Info(string.Format("Applied pending facility damage (tier {0}): {1} facilit{2} demolished.",
+                pendingFacilityTier, demolished, demolished == 1 ? "y" : "ies"));
+            pendingFacilityTier = ConsequenceReport.FacilityTier.None;
         }
 
         // ---- helpers ---------------------------------------------------------------------------
@@ -985,6 +1568,23 @@ namespace Sentry
         {
             string kind = rec.IsComet ? (string.IsNullOrEmpty(rec.CometType) ? "comet" : rec.CometType + " comet") : "asteroid";
             return string.Format("{0} (class {1} {2})", rec.Name, rec.ObjectClass, kind);
+        }
+
+        // Short plain-English rendering of a ConsequenceReport's burst classification, used inside
+        // the localized #SENTRY_frag_consequenceReport fragment (as a single pre-formatted arg,
+        // same convention as every other numeric value passed to Localizer.Format elsewhere in this
+        // file).
+        private static string DescribeBurst(ConsequenceReport report)
+        {
+            switch (report.Class)
+            {
+                case ConsequenceReport.Classification.Airburst:
+                    return Localizer.Format("#SENTRY_frag_burstAirburst", report.BurstAltitudeM.ToString("F0"));
+                case ConsequenceReport.Classification.GroundBurst:
+                    return Localizer.Format("#SENTRY_frag_burstGroundBurst", report.BurstAltitudeM.ToString("F0"));
+                default:
+                    return Localizer.Format("#SENTRY_frag_burstCrater");
+            }
         }
 
         // "UT 4173923 (in 179.4 days)" using the home body's own solar day so planet packs read right.

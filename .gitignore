@@ -6,6 +6,14 @@ archive/
 *.suo
 .vs/
 
+# Packaging copy under GameData/SENTRY/: the DLL/PDB
+# are build output, and advanced.cfg/ui.cfg are per-install player preferences the mod itself
+# generates at runtime - none of these three are source, so none belong in git regardless of which
+# GameData tree they sit in.
+GameData/SENTRY/Plugins/
+GameData/SENTRY/PluginData/advanced.cfg
+GameData/SENTRY/PluginData/ui.cfg
+
 # Referenced game assemblies — NEVER commit
 Assembly-CSharp.dll
 Assembly-CSharp-firstpass.dll
@@ -19,3 +27,6 @@ Directory.Build.props.user
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Claude
+CLAUDE.md
