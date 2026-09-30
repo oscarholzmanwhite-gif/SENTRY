@@ -72,8 +72,6 @@ namespace Sentry
         private bool scanRequested;
         private bool verboseRequested;
         private float sceneStartRealTime;
-        // See the Update() guard for why this exists alongside the OnAwake call.
-        private bool abundanceApplyPending = true;
         private bool audioAlertEnabled = true;
         private bool stopWarpEnabled = true;
         // Creates a stock Alarm Clock entry for each impactor so KSP's own warp
@@ -118,11 +116,6 @@ namespace Sentry
             Instance = this;
             sceneStartRealTime = Time.realtimeSinceStartup;
             AdvancedSettings.EnsureLoaded();
-            // Apply the current Abundance preset every time this scenario spins up (SPACECENTER/
-            // TRACKSTATION/FLIGHT) - ScenarioDiscoverableObjects.Instance is a fresh object each
-            // scene load too, so this can't just be done once.
-            SentrySettings.ApplyAbundance();
-            GameEvents.OnGameSettingsApplied.Add(OnSettingsApplied);
             GameEvents.onPartCouple.Add(OnPartCouple);
             GameEvents.onAsteroidSpawned.Add(OnAsteroidSpawned);
             GameEvents.onCometSpawned.Add(OnCometSpawned);
@@ -130,20 +123,10 @@ namespace Sentry
 
         private void OnDestroy()
         {
-            GameEvents.OnGameSettingsApplied.Remove(OnSettingsApplied);
             GameEvents.onPartCouple.Remove(OnPartCouple);
             GameEvents.onAsteroidSpawned.Remove(OnAsteroidSpawned);
             GameEvents.onCometSpawned.Remove(OnCometSpawned);
             if (Instance == this) Instance = null;
-        }
-
-        // Fires when the player hits Accept in the Esc-menu Settings dialog - re-applies the
-        // Abundance preset immediately rather than waiting for a scene reload. The comet-radius/
-        // impact-lead settings don't need this: they're read fresh from SentrySettings.Instance
-        // every time they're used, never cached.
-        private void OnSettingsApplied()
-        {
-            SentrySettings.ApplyAbundance();
         }
 
         // A brand-new untracked rock from the stock spawner (DiscoverableObjectsUtil.SpawnAsteroid,
@@ -366,21 +349,10 @@ namespace Sentry
 
         private void Update()
         {
-            // OnAwake's ApplyAbundance() call can silently no-op if ScenarioDiscoverableObjects
-            // hasn't run its own OnAwake yet - scenario module instantiation order between this
-            // mod and stock (or any other mod) on a brand-new career isn't something we control,
-            // and unlike an existing save (where this mod's SentryScenario entry was appended
-            // after stock's, so it reliably runs second) a fresh game builds every AddToAllGames
-            // scenario's order from assembly-scan order instead. Retrying here is a fully
-            // reliable fix rather than a guess: Unity runs every component's Awake() for a scene
-            // load before any of their Update()s, so by the time this line first runs,
-            // ScenarioDiscoverableObjects.Instance (also set in ITS OnAwake) is guaranteed to
-            // exist if it's going to exist at all this scene.
-            if (abundanceApplyPending)
-            {
-                abundanceApplyPending = false;
-                SentrySettings.ApplyAbundance();
-            }
+            // Cheap, every-frame, every-scene - see AlarmClockIntegration.SyncWarpSafetyMultiplier's
+            // own comment for what this controls (how snappy the stock Alarm Clock's warp ramp-down
+            // feels) and why it has to run every frame rather than once.
+            AlarmClockIntegration.SyncWarpSafetyMultiplier();
 
             // Only ever anything to do here in the Space Center scene, where DestructibleBuilding
             // GameObjects actually exist - see pendingFacilityTier's own comment. Runs every frame
@@ -407,14 +379,31 @@ namespace Sentry
             bool intervalElapsed = now - lastScanUT >= ScanIntervalSeconds || now < lastScanUT; // second clause: save loaded from an earlier UT
             bool realTimeGapElapsed = Time.realtimeSinceStartup - lastScanRealTime >= AdvancedSettings.MinScanGapRealSeconds;
             bool due = intervalElapsed && realTimeGapElapsed;
-            if (scanRequested || due)
+            // A captured rock being flown changes orbit by the second, under the player's own
+            // control - see AdvancedSettings.CapturedRescanRealSeconds for why the 3-game-hour
+            // interval misses a deflection burn entirely at 1x warp.
+            bool capturedDue = !scanRequested && !due
+                && Time.realtimeSinceStartup - lastScanRealTime >= AdvancedSettings.CapturedRescanRealSeconds
+                && AnyCapturedVesselLoaded();
+            if (scanRequested || due || capturedDue)
             {
                 bool verbose = verboseRequested;
                 scanRequested = false;
                 verboseRequested = false;
                 lastScanRealTime = Time.realtimeSinceStartup;
-                StartCoroutine(ScanRoutine(verbose));
+                StartCoroutine(ScanRoutine(verbose, quietSummary: capturedDue));
             }
+        }
+
+        private bool AnyCapturedVesselLoaded()
+        {
+            foreach (ThreatRecord rec in records.Values)
+            {
+                if (!rec.Captured) continue;
+                Vessel v = FlightGlobals.FindVessel(rec.VesselId);
+                if (v != null && v.loaded) return true;
+            }
+            return false;
         }
 
         // The full scan (ScanRoutine) only runs every ScanIntervalSeconds of GAME time (3 hours),
@@ -954,7 +943,10 @@ namespace Sentry
 
         // ---- scanning --------------------------------------------------------------------------
 
-        private IEnumerator ScanRoutine(bool verbose)
+        // quietSummary: skip the "Scan end" line unless something was pruned - set for the
+        // once-a-second captured-rock rescans, which would otherwise log a line every second the
+        // player spends flying it (that record is always recomputed, since its epoch keeps moving).
+        private IEnumerator ScanRoutine(bool verbose, bool quietSummary = false)
         {
             scanRunning = true;
             Stopwatch total = Stopwatch.StartNew();
@@ -1097,7 +1089,7 @@ namespace Sentry
             total.Stop();
             // Skip the summary line when nothing happened (pure cache hits) - otherwise this fires
             // every frame at high time warp and floods KSP.log for no information.
-            if (verbose || computed > 0 || gone.Count > 0)
+            if (verbose || (computed > 0 && !quietSummary) || gone.Count > 0)
             {
                 Debug.Log(string.Format("[SENTRY] ---- Scan end: {0} objects, {1} cache hits, {2} computed ({3:F1} ms compute, {4:F0} ms wall incl. frame yields), {5} records pruned ----",
                     candidates.Count, cacheHits, computed, computeMs, total.Elapsed.TotalMilliseconds, gone.Count));
@@ -1118,10 +1110,24 @@ namespace Sentry
 
             ThreatState oldState = rec.State;
             double oldImpactUT = rec.ImpactUT;
+            double oldEpoch = rec.OrbitEpoch; // captured before it's overwritten below - see CheckDeflectionBonus
 
             ThreatState newState = ThreatState.Ignored;
             if (result.EncounterFound) newState = result.IsImpact ? ThreatState.Impact : ThreatState.NearPass;
             else if (!double.IsNaN(approachDist)) newState = ThreatState.CloseApproach;
+
+            // Deflection-bonus dwell-time bookkeeping (mechanical, not part of the eligibility
+            // decision itself - see CheckDeflectionBonus below). Every FRESH entry into Impact
+            // restarts the clock; any exit clears it, so a later re-entry starts a brand new stint
+            // rather than reusing however long some earlier, unrelated stint had already run.
+            if (newState == ThreatState.Impact && oldState != ThreatState.Impact)
+            {
+                rec.ImpactStateEnteredUT = now;
+            }
+            else if (newState != ThreatState.Impact)
+            {
+                rec.ImpactStateEnteredUT = double.NaN;
+            }
 
             // Refresh everything we know.
             rec.Name = v.vesselName;
@@ -1211,6 +1217,13 @@ namespace Sentry
                 }
             }
 
+            // Deflection bonus: pays out (and posts its own alert) when this exit from Impact is a
+            // genuine, once-only, player-relevant redirect - see the method's own TODO for the full
+            // guard contract. Independent of the rec.Captured branch just below: a captured object's
+            // deflection is the MOST legitimate case (the player is unambiguously flying it) and
+            // should still pay, even though its ROUTINE chatter stays suppressed either way.
+            bool deflectionPaid = CheckDeflectionBonus(rec, oldState, newState, oldEpoch, result, v, now, homeBody, label);
+
             if (newState != oldState)
             {
                 rec.LastChangeUT = now;
@@ -1225,59 +1238,74 @@ namespace Sentry
                         label, v.vesselName, oldState, newState));
                 }
                 else switch (newState)
-                {
-                    case ThreatState.Impact:
-                        // stopWarpEligible only the very first time this record ever becomes an
-                        // impact threat - giving the player a chance to plan a redirect mission the
-                        // moment a NEW threat shows up. DiscoveryWarpStopped is a lifetime latch
-                        // (never reset), so if a later orbit refinement knocks this same object out
-                        // of Impact and back in again, it does NOT force warp down a second time -
-                        // that used to happen since the old code re-armed on every re-entry
-                        // into Impact, not just the first. Every other severe event for this record
-                        // (revision, imminent, confirmed) already leaves warp alone - the stock Alarm
-                        // Clock (armed just below) reliably handles the actual terminal cut on its
-                        // own schedule, so repeating our own forced stop would just be naggy.
-                        bool isNewThreat = !rec.DiscoveryWarpStopped;
-                        rec.DiscoveryWarpStopped = true;
-                        AlertLog.Alert(Localizer.Format("#SENTRY_title_impactPredicted"),
-                            Localizer.Format("#SENTRY_msg_impactPredicted",
-                                label, homeBody.name, When(rec.ImpactUT, now, homeBody), rec.CapturePeA.ToString("F0"), result.ThresholdAltitude.ToString("F0"), When(rec.EntryUT, now, homeBody)),
-                            severe: true, stopWarpEligible: isNewThreat);
-                        break; // ArmAlarm already ran above - it applies to captured objects too
-                    case ThreatState.NearPass:
-                        if (oldState == ThreatState.Impact)
-                            AlertLog.Notice(Localizer.Format("#SENTRY_title_allClear"),
-                                Localizer.Format("#SENTRY_msg_allClearToNearPass", label, homeBody.name, rec.CapturePeA.ToString("F0"), When(rec.PeriapsisUT, now, homeBody)));
-                        else if (rec.IsComet)
-                            // Comets rarely enter the SOI at all (their orbits aren't aimed at the
-                            // home body like asteroids' are) - when one does, it's closer than any
-                            // "close approach" and worth a screen notice, but not another inbox
-                            // entry (see AlertLog.Notice) - orbit refinement can flicker this in
-                            // and out repeatedly.
-                            AlertLog.Notice(Localizer.Format("#SENTRY_title_cometApproachingSoi"),
-                                Localizer.Format("#SENTRY_msg_cometApproachingSoi", label, homeBody.name, When(rec.EntryUT, now, homeBody), rec.CapturePeA.ToString("F0")));
-                        else
-                            AlertLog.Info(string.Format("{0} will pass through {1}'s SOI: entry {2}, periapsis {3:F0} m.",
-                                label, homeBody.name, When(rec.EntryUT, now, homeBody), rec.CapturePeA));
-                        break;
-                    case ThreatState.CloseApproach:
-                        if (oldState == ThreatState.Impact || oldState == ThreatState.NearPass)
-                            AlertLog.Notice(Localizer.Format("#SENTRY_title_allClear"),
-                                Localizer.Format("#SENTRY_msg_allClearToCloseApproach", label, homeBody.name, rec.ClosestApproachDistance.ToString("F0"), When(rec.ClosestApproachUT, now, homeBody)));
-                        else
-                            AlertLog.Notice(Localizer.Format("#SENTRY_title_cometApproach"),
-                                Localizer.Format("#SENTRY_msg_cometApproach", label, rec.ClosestApproachDistance.ToString("F0"), homeBody.name, When(rec.ClosestApproachUT, now, homeBody)));
-                        break;
-                    case ThreatState.Ignored:
-                        if (oldState == ThreatState.Impact)
-                            AlertLog.Notice(Localizer.Format("#SENTRY_title_allClear"),
-                                Localizer.Format("#SENTRY_msg_allClearToIgnored", label, homeBody.name, result.Note));
-                        else if (!isNew)
-                            AlertLog.Info(string.Format("{0} is no longer predicted to enter {1}'s SOI ({2}).", label, homeBody.name, result.Note));
-                        else
-                            Debug.Log(string.Format("[SENTRY] New object {0}: no threat ({1}).", label, result.Note));
-                        break;
-                }
+                    {
+                        case ThreatState.Impact:
+                            // stopWarpEligible only the very first time this record ever becomes an
+                            // impact threat - giving the player a chance to plan a redirect mission the
+                            // moment a NEW threat shows up. DiscoveryWarpStopped is a lifetime latch
+                            // (never reset), so if a later orbit refinement knocks this same object out
+                            // of Impact and back in again, it does NOT force warp down a second time -
+                            // that used to happen since the old code re-armed on every re-entry
+                            // into Impact, not just the first. Every other severe event for this record
+                            // (revision, imminent, confirmed) already leaves warp alone - the stock Alarm
+                            // Clock (armed just below) reliably handles the actual terminal cut on its
+                            // own schedule, so repeating our own forced stop would just be naggy.
+                            bool isNewThreat = !rec.DiscoveryWarpStopped;
+                            rec.DiscoveryWarpStopped = true;
+                            AlertLog.Alert(Localizer.Format("#SENTRY_title_impactPredicted"),
+                                Localizer.Format("#SENTRY_msg_impactPredicted",
+                                    label, homeBody.name, When(rec.ImpactUT, now, homeBody), rec.CapturePeA.ToString("F0"), result.ThresholdAltitude.ToString("F0"), When(rec.EntryUT, now, homeBody)),
+                                severe: true, stopWarpEligible: isNewThreat);
+                            break; // ArmAlarm already ran above - it applies to captured objects too
+                        case ThreatState.NearPass:
+                            if (oldState == ThreatState.Impact && deflectionPaid)
+                            {
+                                // CheckDeflectionBonus already posted its own alert for this exit -
+                                // nothing more to say here.
+                            }
+                            else if (oldState == ThreatState.Impact)
+                                AlertLog.Notice(Localizer.Format("#SENTRY_title_allClear"),
+                                    Localizer.Format("#SENTRY_msg_allClearToNearPass", label, homeBody.name, rec.CapturePeA.ToString("F0"), When(rec.PeriapsisUT, now, homeBody)));
+                            else if (rec.IsComet)
+                                // Comets rarely enter the SOI at all (their orbits aren't aimed at the
+                                // home body like asteroids' are) - when one does, it's closer than any
+                                // "close approach" and worth a screen notice, but not another inbox
+                                // entry (see AlertLog.Notice) - orbit refinement can flicker this in
+                                // and out repeatedly.
+                                AlertLog.Notice(Localizer.Format("#SENTRY_title_cometApproachingSoi"),
+                                    Localizer.Format("#SENTRY_msg_cometApproachingSoi", label, homeBody.name, When(rec.EntryUT, now, homeBody), rec.CapturePeA.ToString("F0")));
+                            else
+                                AlertLog.Info(string.Format("{0} will pass through {1}'s SOI: entry {2}, periapsis {3:F0} m.",
+                                    label, homeBody.name, When(rec.EntryUT, now, homeBody), rec.CapturePeA));
+                            break;
+                        case ThreatState.CloseApproach:
+                            if (oldState == ThreatState.Impact && deflectionPaid)
+                            {
+                                // CheckDeflectionBonus already posted its own alert for this exit -
+                                // nothing more to say here.
+                            }
+                            else if (oldState == ThreatState.Impact || oldState == ThreatState.NearPass)
+                                AlertLog.Notice(Localizer.Format("#SENTRY_title_allClear"),
+                                    Localizer.Format("#SENTRY_msg_allClearToCloseApproach", label, homeBody.name, rec.ClosestApproachDistance.ToString("F0"), When(rec.ClosestApproachUT, now, homeBody)));
+                            else
+                                AlertLog.Notice(Localizer.Format("#SENTRY_title_cometApproach"),
+                                    Localizer.Format("#SENTRY_msg_cometApproach", label, rec.ClosestApproachDistance.ToString("F0"), homeBody.name, When(rec.ClosestApproachUT, now, homeBody)));
+                            break;
+                        case ThreatState.Ignored:
+                            if (oldState == ThreatState.Impact && deflectionPaid)
+                            {
+                                // CheckDeflectionBonus already posted its own alert for this exit -
+                                // nothing more to say here.
+                            }
+                            else if (oldState == ThreatState.Impact)
+                                AlertLog.Notice(Localizer.Format("#SENTRY_title_allClear"),
+                                    Localizer.Format("#SENTRY_msg_allClearToIgnored", label, homeBody.name, result.Note));
+                            else if (!isNew)
+                                AlertLog.Info(string.Format("{0} is no longer predicted to enter {1}'s SOI ({2}).", label, homeBody.name, result.Note));
+                            else
+                                Debug.Log(string.Format("[SENTRY] New object {0}: no threat ({1}).", label, result.Note));
+                            break;
+                    }
             }
             else if (newState == ThreatState.Impact && Math.Abs(rec.ImpactUT - oldImpactUT) > AdvancedSettings.ImpactShiftAlertSeconds)
             {
@@ -1303,6 +1331,125 @@ namespace Sentry
             // objects that can expire - a craft the player is flying can't, and has no business
             // having its discovery level rewritten by this mod.
             if (!rec.Captured) UpdateTracking(rec, v);
+        }
+
+        // Deflection bonus - pays a positive reputation reward the first (and only the first) time
+        // a record's genuine, sustained Impact verdict resolves to a genuinely safe non-impact
+        // verdict. Called from ApplyResult right after rec's fields have already been refreshed for
+        // newState/result (rec.CapturePeA, rec.OrbitEpoch, etc. are the NEW values) but before the
+        // switch that would otherwise post a plain "All clear" notice for the same transition -
+        // return true to suppress that notice (this method posts its own alert instead) or false to
+        // let it through unchanged (nothing paid, nothing to announce).
+        //
+        // Per CLAUDE.md's "Deflection bonus and its exploit guard" design doc, and the owner's own
+        // 2026-09-27 simplification of it (no proximity/player-caused check needed - a rare
+        // gravity-assist "free" bonus is an acceptable cost, but a deflection must NEVER pay out
+        // more than once for the same object):
+        //
+        //   1. This must be a genuine exit from Impact, not a routine re-evaluation of something
+        //      that was never really Impact to begin with: oldState == ThreatState.Impact AND
+        //      newState != ThreatState.Impact.
+        //   2. The orbit must have actually changed (oldEpoch, captured in ApplyResult before it
+        //      overwrote rec.OrbitEpoch, vs. v.orbit.epoch now) - ScanRoutine's own cache-hit check
+        //      (rec.OrbitEpoch == o.epoch) means ApplyResult CAN still run again with an unchanged
+        //      epoch purely because rec.ValidUntilUT expired (e.g. the "already inside SOI" branch
+        //      revalidates every single scan) - an epoch-unchanged exit from Impact is our own math
+        //      re-converging on a better answer, not a real deflection, and must not pay.
+        //   3. Minimum dwell: rec.ImpactStateEnteredUT (already maintained for you in ApplyResult -
+        //      set on every FRESH entry into Impact, cleared to NaN on every exit) must show this
+        //      stint lasted at least AdvancedSettings.DeflectionMinDwellSeconds before this exit.
+        //      Guards against a marginal object flickering in and out of Impact during ordinary
+        //      orbit refinement triggering (or re-triggering, once epoch happens to tick over) a
+        //      payout for a "deflection" that was never a sustained, real threat.
+        //   4. Post-deflection clearance margin: the NEW periapsis must clear the impact threshold
+        //      by a real margin, not just barely - rec.CapturePeA (already the new value) vs.
+        //      result.ThresholdAltitude + AdvancedSettings.DeflectionMinPeriapsisMarginM. A rock
+        //      nudged from 69 km to 71 km is not deflected.
+        //   5. Once-only: rec.HasPaidDeflection must be false, and must be set true the moment this
+        //      pays out - this is the core anti-farm guard (bonus once, penalty always).
+        //
+        // If all five hold: compute a nominal "would-be" energy via
+        // ImpactConsequence.TryEstimateNominalEnergyKt(rec) (the object's own class/real mass at a
+        // fixed nominal impact speed - there's no live trajectory left to measure a precise speed
+        // from once it's been redirected), convert to a bonus via
+        // ImpactConsequence.InterpolateDeflectionBonus(energyKt), scale by
+        // SentrySettings.Instance.damageCoefficient (the same "how big/dramatic overall" master
+        // dial the penalty side uses - deflection deliberately does NOT use reputationScaling, which
+        // is documented as specifically a PENALTY-side knob), and apply it in career mode via
+        // Reputation.Instance.AddReputation - capped so the requested delta never pushes
+        // Reputation.CurrentRep past +Reputation.RepRange (+1000), mirroring EXACTLY the existing
+        // floor-clamp pattern in ReportConfirmedImpact (just the opposite direction - a ceiling, not
+        // a floor). Post #SENTRY_title_deflectionSuccess/#SENTRY_msg_deflectionSuccess as a real
+        // AlertLog.Alert for a loose object, or AlertLog.Info only if rec.Captured (matching the
+        // established precedent elsewhere in this method: a captured object's own pilot already
+        // knows they just redirected it - no fanfare needed, just log it and still pay the reward).
+        private bool CheckDeflectionBonus(ThreatRecord rec, ThreatState oldState, ThreatState newState,
+            double oldEpoch, EncounterResult result, Vessel v, double now, CelestialBody homeBody, string label)
+        {
+            // TODO(human): split guard 4 out of the "moment of exit" check using
+            // rec.DeflectionAwaitingClearance (see its comment in ThreatRecord). A genuine exit that
+            // passes guards 1/2/3/5 but not 4 should set the flag instead of giving up; a later call
+            // (NearPass -> NearPass etc.) with the flag set pays out once guard 4 passes; and
+            // re-entering Impact should clear it.
+            // I'm just gonna nest `if`s. There's probably a more efficient structure, but see note on C#.
+            // Check 1
+            string homeName = homeBody != null ? homeBody.name : "the home body";
+            if (oldState == ThreatState.Impact && newState != ThreatState.Impact)
+            {
+                // Check 2
+                if (oldEpoch != v.orbit.epoch)
+                {
+                    // Check 3
+                    if (now - rec.ImpactStateEnteredUT > AdvancedSettings.DeflectionMinDwellSeconds)
+                    {
+                        // Check 4
+                        // A rock nudged from 69km to 71km is technically deflected, though. And it's not clear that a rock with a pe of 69km is a threat that needs deflecting, either. This might need more thought.
+                        if (rec.CapturePeA > result.ThresholdAltitude + AdvancedSettings.DeflectionMinPeriapsisMarginM)
+                        {
+                            // Check 5
+                            double bonus = 0;
+                            if (!rec.HasPaidDeflection)
+                            {
+                                if (ImpactConsequence.TryEstimateNominalEnergyKt(rec, out double energyKt))
+                                {
+                                    bonus = ImpactConsequence.InterpolateDeflectionBonus(energyKt);
+                                    bonus *= SentrySettings.Instance.damageCoefficient;
+                                    // I guess C# only evaluates the second thing in an && after the first is true. I could've used that above.
+                                    bool isCareer = HighLogic.CurrentGame != null && HighLogic.CurrentGame.Mode == Game.Modes.CAREER;
+                                    // Not sure if the if is in the right spot
+                                    if (isCareer && Reputation.Instance != null)
+                                    {
+                                        // The instructions said to EXACTLY follow the pattern from ReportConfirmedImpact
+                                        float ceiling = Reputation.RepRange;
+                                        float remainingBudget = ceiling - Reputation.CurrentRep;
+                                        // Not sure how this could happen
+                                        if (remainingBudget <= 0f)
+                                        {
+                                            bonus = 0;
+                                        }
+                                        // Don't account for diminishing returns
+                                        else if (bonus > remainingBudget)
+                                        {
+                                            bonus = remainingBudget;
+                                        }
+                                        if (bonus != 0)
+                                        {
+                                            // Last minute cast to `float`
+                                            Reputation.Instance.AddReputation((float)bonus, TransactionReasons.None);
+                                        }
+                                    }
+                                    rec.HasPaidDeflection = true;
+                                    // I feel like someone piloting a vessel who redirects an asteroid might still want the screen notification with how much rep they earned since there are very few other occasions when a redirect might occur. I might have something wrong, though. Please push back if you disagree.
+                                    // I probably messed the `AlertLog.Alert` syntax up
+                                    AlertLog.Alert(Localizer.Format("#SENTRY_title_deflectionSuccess"), Localizer.Format("#SENTRY_msg_deflectionSuccess", label, homeName, bonus.ToString("F0")), severe: false, stopWarpEligible: false);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
         }
 
         private void HandleDisappearance(ThreatRecord rec, double now, CelestialBody homeBody)

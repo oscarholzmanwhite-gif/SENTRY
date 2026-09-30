@@ -42,19 +42,33 @@ namespace Sentry
         // sea level, well above any controlled touchdown.
         public static double ImpactSurfaceSpeedCutoffMs = 340.0;
 
-        // Asteroid Abundance preset raw values (SentrySettings.ApplyAbundance) - the
-        // numbers behind the Low/Normal/High choice on the in-game settings screen. Edit these if
-        // the built-in presets don't feel right; the dropdown itself still lives in GameParameters.
-        // Normal matches ScenarioDiscoverableObjects' own stock defaults.
-        public static int AbundanceLowSpawnOddsAgainst = 4;
-        public static int AbundanceLowSpawnGroupMinLimit = 1;
-        public static int AbundanceLowSpawnGroupMaxLimit = 5;
-        public static int AbundanceNormalSpawnOddsAgainst = 2;
-        public static int AbundanceNormalSpawnGroupMinLimit = 3;
-        public static int AbundanceNormalSpawnGroupMaxLimit = 10;
-        public static int AbundanceHighSpawnOddsAgainst = 1;
-        public static int AbundanceHighSpawnGroupMinLimit = 5;
-        public static int AbundanceHighSpawnGroupMaxLimit = 15;
+        // Nominal impact speed (m/s) used ONLY for ImpactConsequence.TryEstimateNominalEnergyKt
+        // (the deflection bonus) - a deflected object's real orbit no longer predicts an impact at
+        // all, so there's no live trajectory to measure a precise entry speed from. Matches the
+        // design doc's own stated baseline: "Impact speed ~ sqrt(v_inf^2 + v_esc^2) ... ~4 km/s
+        // baseline" - the same assumption the original penalty table's own calibration ("30x
+        // density assumed, 4 km/s, land impact") was built on, so the deflection bonus table (which
+        // reuses those exact same energy anchors) is measuring against a consistent baseline.
+        public static double NominalImpactSpeedMs = 4000.0;
+
+        // Minimum time (game-seconds) a record must have continuously held ThreatState.Impact
+        // before a deflection out of it can pay a bonus - the design doc's own "at least two scans"
+        // anti-flicker guard, so an object oscillating in and out of Impact during ordinary orbit
+        // refinement can't repeatedly (mis)trigger the reward. ~2x ScanIntervalSeconds (3 game
+        // hours) by default.
+        public static double DeflectionMinDwellSeconds = 21600.0;
+
+        // Minimum clearance (m) a deflected object's new periapsis must have above the impact
+        // threshold altitude (atmosphere top / surface) before it counts as genuinely "cleared,"
+        // not just nudged from e.g. 69 km to 71 km - the design doc's own explicit example of what
+        // should NOT count. Hand-tune if 5 km feels too strict or too lenient once tested.
+        public static double DeflectionMinPeriapsisMarginM = 5000.0;
+
+        // Real-time rescan cadence (s) while a captured rock's vessel is loaded. The normal scan
+        // runs every 3 in-game hours, which at 1x warp (i.e. while the player is flying the rock)
+        // is 3 real hours - so a deflection burn's Impact -> NearPass change went unnoticed until
+        // the player happened to time-warp. Everything else in such a scan is a cache hit.
+        public static float CapturedRescanRealSeconds = 1.0f;
 
         // ---- Impact consequence model (ImpactConsequence.cs) - v1 "compute and report" only, none
         // of this is ever applied to Reputation/Funds/DestructibleBuilding. These are the "what does
@@ -76,14 +90,21 @@ namespace Sentry
         // airbursts," same journal, which reproduces the ablative pancake-model equations A11-A18).
         public static double BurstDispersionAlpha = 0.001;
 
-        // Atmosphere scale height (m). Kerbin value (~5,600 m, vs Earth's
-        // ~8,500 m) - rarely worth touching, it's a physics fact about this specific body, not a
-        // preference.
+        // FALLBACK ONLY (~5,600 m, stock Kerbin's real value, vs Earth's ~8,500 m) - as of this
+        // pass, ImpactConsequence.EstimateScaleHeightM derives the real value live from the actual
+        // home body's own pressure profile (a two-point log-ratio against home.GetPressure), so a
+        // planet pack (RSS, JNSQ, GPP, ...) gets its own body's real atmosphere instead of Kerbin's
+        // regardless of what's actually loaded - this constant only kicks in if that derivation
+        // can't run (no atmosphere, or degenerate pressure data).
         public static double AtmosphereScaleHeightM = 5600.0;
 
         // Kerbin's atmosphere is thinner than Earth's, so blast energy couples to the ground more
-        // efficiently (lower burst altitudes for a given size/speed) - "physics, not
-        // fudge" correction, applied as a flat multiplier on facility-damage radii.
+        // efficiently (lower burst altitudes for a given size/speed) - "physics, not fudge"
+        // correction, applied as a flat multiplier on facility-damage radii. This is a Kerbin-vs-
+        // Earth COMPARISON, not a derivable fact about an arbitrary body (unlike the scale height
+        // above) - ImpactConsequence.FacilityCheck only applies it when the actual home body is
+        // named "Kerbin"; any other home body (a planet pack's own world) gets no correction
+        // (multiplier 1.0) rather than an unjustified one.
         public static double AtmosphereThinnessMultiplier = 1.5;
 
         // Above this burst altitude (m), classify as a harmless high airburst rather than a
@@ -159,6 +180,27 @@ namespace Sentry
         // this budget is a generous safety margin, not a tuned value.
         public static float RealMassCaptureTimeoutSeconds = 2.0f;
 
+        // Mirrors stock's own AlarmClockScenario.warpChangeTimeSafteyMultiplier (decompile-
+        // confirmed public instance field, stock default 1.2) - the real-time margin the stock
+        // Alarm Clock uses to decide WHEN to start paying attention to an approaching alarm at all
+        // (HandleWarpActions gates on currentUT + warpRate * this > alarm.ut). Once it starts, it
+        // already self-accelerates: it steps down one warp level per completed transition while
+        // there's slack, and falls back to instant (no-fade) single-level drops the moment it's
+        // behind schedule - so this margin mostly controls how much of the descent happens as a
+        // gradual early fade vs. a snappier late catch-up, not the total number of levels crossed.
+        // A LOWER value delays the gradual fade, pushing more of the ramp into the fast catch-up
+        // path (feels snappier, closer to the actual event) - which is what SentryScenario.Update
+        // applies this for (AlarmClockIntegration.SyncWarpSafetyMultiplier), at the owner's request.
+        // IMPORTANT: this is stock's own single scenario-wide field, not per-alarm - lowering it
+        // changes the ramp-down feel for EVERY stock alarm in the save (maneuver nodes, contract
+        // deadlines, etc.), not just SENTRY's own kill-warp alarms. It's also a real safety margin,
+        // not just a feel knob: at extreme warp rates, too low a value risks not leaving enough
+        // real time to actually reach 1x before the target UT is skipped over entirely - precisely
+        // the "asteroid warps clean through Kerbin" failure mode the whole Alarm Clock integration
+        // exists to prevent. Default here (1.0) is a modest ~17% reduction from stock's 1.2; don't
+        // push this much lower without testing carefully at your own highest normal warp rate.
+        public static double AlarmClockWarpSafetyMultiplier = 1.0;
+
         private static bool loaded;
 
         private static string FilePath
@@ -186,15 +228,10 @@ namespace Sentry
                 node.TryGetValue("minScanGapRealSeconds", ref MinScanGapRealSeconds);
                 node.TryGetValue("firstScanDelayRealSeconds", ref FirstScanDelayRealSeconds);
                 node.TryGetValue("impactSurfaceSpeedCutoffMs", ref ImpactSurfaceSpeedCutoffMs);
-                node.TryGetValue("abundanceLowSpawnOddsAgainst", ref AbundanceLowSpawnOddsAgainst);
-                node.TryGetValue("abundanceLowSpawnGroupMinLimit", ref AbundanceLowSpawnGroupMinLimit);
-                node.TryGetValue("abundanceLowSpawnGroupMaxLimit", ref AbundanceLowSpawnGroupMaxLimit);
-                node.TryGetValue("abundanceNormalSpawnOddsAgainst", ref AbundanceNormalSpawnOddsAgainst);
-                node.TryGetValue("abundanceNormalSpawnGroupMinLimit", ref AbundanceNormalSpawnGroupMinLimit);
-                node.TryGetValue("abundanceNormalSpawnGroupMaxLimit", ref AbundanceNormalSpawnGroupMaxLimit);
-                node.TryGetValue("abundanceHighSpawnOddsAgainst", ref AbundanceHighSpawnOddsAgainst);
-                node.TryGetValue("abundanceHighSpawnGroupMinLimit", ref AbundanceHighSpawnGroupMinLimit);
-                node.TryGetValue("abundanceHighSpawnGroupMaxLimit", ref AbundanceHighSpawnGroupMaxLimit);
+                node.TryGetValue("nominalImpactSpeedMs", ref NominalImpactSpeedMs);
+                node.TryGetValue("deflectionMinDwellSeconds", ref DeflectionMinDwellSeconds);
+                node.TryGetValue("deflectionMinPeriapsisMarginM", ref DeflectionMinPeriapsisMarginM);
+                node.TryGetValue("capturedRescanRealSeconds", ref CapturedRescanRealSeconds);
                 node.TryGetValue("rubblePileStrengthPa", ref RubblePileStrengthPa);
                 node.TryGetValue("dragCoefficient", ref DragCoefficient);
                 node.TryGetValue("burstDispersionAlpha", ref BurstDispersionAlpha);
@@ -217,6 +254,7 @@ namespace Sentry
                 node.TryGetValue("mitigationDecayPerYear", ref MitigationDecayPerYear);
                 node.TryGetValue("mitigationPower", ref MitigationPower);
                 node.TryGetValue("realMassCaptureTimeoutSeconds", ref RealMassCaptureTimeoutSeconds);
+                node.TryGetValue("alarmClockWarpSafetyMultiplier", ref AlarmClockWarpSafetyMultiplier);
             }
             catch (Exception e)
             {
@@ -236,15 +274,10 @@ namespace Sentry
                 node.AddValue("minScanGapRealSeconds", MinScanGapRealSeconds);
                 node.AddValue("firstScanDelayRealSeconds", FirstScanDelayRealSeconds);
                 node.AddValue("impactSurfaceSpeedCutoffMs", ImpactSurfaceSpeedCutoffMs);
-                node.AddValue("abundanceLowSpawnOddsAgainst", AbundanceLowSpawnOddsAgainst);
-                node.AddValue("abundanceLowSpawnGroupMinLimit", AbundanceLowSpawnGroupMinLimit);
-                node.AddValue("abundanceLowSpawnGroupMaxLimit", AbundanceLowSpawnGroupMaxLimit);
-                node.AddValue("abundanceNormalSpawnOddsAgainst", AbundanceNormalSpawnOddsAgainst);
-                node.AddValue("abundanceNormalSpawnGroupMinLimit", AbundanceNormalSpawnGroupMinLimit);
-                node.AddValue("abundanceNormalSpawnGroupMaxLimit", AbundanceNormalSpawnGroupMaxLimit);
-                node.AddValue("abundanceHighSpawnOddsAgainst", AbundanceHighSpawnOddsAgainst);
-                node.AddValue("abundanceHighSpawnGroupMinLimit", AbundanceHighSpawnGroupMinLimit);
-                node.AddValue("abundanceHighSpawnGroupMaxLimit", AbundanceHighSpawnGroupMaxLimit);
+                node.AddValue("nominalImpactSpeedMs", NominalImpactSpeedMs);
+                node.AddValue("deflectionMinDwellSeconds", DeflectionMinDwellSeconds);
+                node.AddValue("deflectionMinPeriapsisMarginM", DeflectionMinPeriapsisMarginM);
+                node.AddValue("capturedRescanRealSeconds", CapturedRescanRealSeconds);
                 node.AddValue("rubblePileStrengthPa", RubblePileStrengthPa);
                 node.AddValue("dragCoefficient", DragCoefficient);
                 node.AddValue("burstDispersionAlpha", BurstDispersionAlpha);
@@ -266,6 +299,8 @@ namespace Sentry
                 node.AddValue("mitigationFloor", MitigationFloor);
                 node.AddValue("mitigationDecayPerYear", MitigationDecayPerYear);
                 node.AddValue("mitigationPower", MitigationPower);
+                node.AddValue("realMassCaptureTimeoutSeconds", RealMassCaptureTimeoutSeconds);
+                node.AddValue("alarmClockWarpSafetyMultiplier", AlarmClockWarpSafetyMultiplier);
 
                 string dir = Path.GetDirectoryName(FilePath);
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);

@@ -115,7 +115,11 @@ namespace Sentry.UI
                 if (ImpactConsequence.TryGetPredictedState(r, homeBody, out ImpactState predicted))
                 {
                     ConsequenceReport report = ImpactConsequence.Compute(r, predicted, homeBody);
-                    if (report.Valid) estimates[r.VesselId] = report;
+                    if (report.Valid)
+                    {
+                        estimates[r.VesselId] = report;
+                        LogEstimateIfChanged(r, predicted, report, homeBody);
+                    }
                 }
             }
 
@@ -355,6 +359,33 @@ namespace Sentry.UI
         // class column is colored red rather than the milder default - a plain visual flag for
         // "this one is worth paying attention to", not tied to any actual game-state clamp.
         private const double DangerRepThreshold = 10.0;
+
+        // Diagnostic for the live estimate, which is otherwise never logged: prints every input the
+        // number depends on the first time a record is estimated, and again only if the rep figure
+        // moves by more than 25% - so a sudden jump is captured with its cause, without spamming.
+        private static readonly Dictionary<Guid, double> lastLoggedEstimateRep = new Dictionary<Guid, double>();
+
+        private static void LogEstimateIfChanged(ThreatRecord r, ImpactState predicted, ConsequenceReport report, CelestialBody homeBody)
+        {
+            double rep = Math.Abs(report.WouldBeReputationDelta);
+            if (lastLoggedEstimateRep.TryGetValue(r.VesselId, out double last)
+                && Math.Abs(rep - last) <= 0.25 * Math.Max(last, 1.0))
+            {
+                return;
+            }
+            lastLoggedEstimateRep[r.VesselId] = rep;
+
+            Vector3d rotFrameVel = Vector3d.Cross(homeBody.angularVelocity, predicted.RelPos.xzy);
+            double entrySurfaceSpeed = (predicted.RelVel.xzy - rotFrameVel).magnitude;
+            Debug.Log(string.Format(
+                "[SENTRY] Estimate for {0}: {1:F0} rep, {2:F2} kt | mass {3:F0} kg ({4}) | sample UT {5:F0}, alt {6:F0} m, " +
+                "entry surface speed {7:F0} m/s, final speed {8:F0} m/s | {9} at {10:F0} m | {11} | lead {12:F1} d | ref body {13}, captured {14}",
+                r.Name, rep, report.EnergyKtTnt, report.MassKg, double.IsNaN(r.RealMassKg) ? "nominal" : "real",
+                predicted.UT, predicted.RelPos.magnitude - homeBody.Radius,
+                entrySurfaceSpeed, report.SpeedMs, report.Class, report.BurstAltitudeM,
+                report.IsOcean ? "ocean" : "land", report.LeadTimeSeconds / 86400.0,
+                r.ReferenceBody, r.Captured));
+        }
 
         private void DrawRow(ThreatRecord r, double now, double day, CelestialBody homeBody, ConsequenceReport? estimate)
         {

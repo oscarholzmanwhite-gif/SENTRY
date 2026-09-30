@@ -83,6 +83,25 @@ namespace Sentry
         // threat showed up" interrupt.
         public bool DiscoveryWarpStopped;
 
+        // Deflection bonus bookkeeping (see SentryScenario.ApplyResult's deflection-check hook,
+        // still under construction as of this writing - see CLAUDE.md). HasPaidDeflection is a
+        // lifetime latch: once true, this object can never pay the bonus again, no matter how many
+        // more times it flickers into and out of Impact state - the design doc's explicit anti-farm
+        // guard (bonus once, penalty always, asymmetric on purpose). ImpactStateEnteredUT is NOT a
+        // lifetime latch like DiscoveryWarpStopped - it's meant to be reset to NaN on every exit
+        // from Impact and re-set to the current UT on every FRESH entry, so the minimum-dwell guard
+        // restarts for each new stint rather than being satisfied once and then never checked again.
+        public bool HasPaidDeflection;
+        public double ImpactStateEnteredUT = double.NaN;
+
+        // Set when a record makes a genuine exit from Impact (epoch changed, dwell met, not already
+        // paid) but its new periapsis hasn't yet cleared DeflectionMinPeriapsisMarginM. Needed
+        // because a continuous burn is caught by the ~1 s captured-rock rescan the instant
+        // periapsis crosses the threshold - i.e. with essentially zero margin - and every later
+        // scan is NearPass -> NearPass, so a check made only at the moment of exit could never
+        // pass. Persisted, so a deflection finished across a save/load still counts.
+        public bool DeflectionAwaitingClearance;
+
         // Last altitude/surface-relative speed observed for this vessel while it was still
         // findable (see SentryScenario.WatchImminentImpacts), used to tell a genuine
         // high-speed impact apart from the vessel disappearing some other way (recovered,
@@ -207,6 +226,9 @@ namespace Sentry
             node.AddValue("alarmId", AlarmId);
             node.AddValue("imminentAlertFired", ImminentAlertFired);
             node.AddValue("discoveryWarpStopped", DiscoveryWarpStopped);
+            node.AddValue("hasPaidDeflection", HasPaidDeflection);
+            node.AddValue("impactStateEnteredUT", Fmt(ImpactStateEnteredUT));
+            node.AddValue("deflectionAwaitingClearance", DeflectionAwaitingClearance);
         }
 
         public static ThreatRecord Load(ConfigNode node)
@@ -245,6 +267,18 @@ namespace Sentry
             node.TryGetValue("alarmId", ref r.AlarmId);
             node.TryGetValue("imminentAlertFired", ref r.ImminentAlertFired);
             node.TryGetValue("discoveryWarpStopped", ref r.DiscoveryWarpStopped);
+            node.TryGetValue("hasPaidDeflection", ref r.HasPaidDeflection);
+            r.ImpactStateEnteredUT = ReadDouble(node, "impactStateEnteredUT");
+            node.TryGetValue("deflectionAwaitingClearance", ref r.DeflectionAwaitingClearance);
+            // Migration: a record already in Impact from a save written before this field existed
+            // (or one that never freshly re-entered Impact since) has no stint start, and NaN fails
+            // every dwell comparison, silently blocking the deflection bonus forever. FirstSeenUT,
+            // not LastChangeUT: the latter is bumped by every >1 h impact-time revision, which a
+            // captured craft being flown triggers constantly, so it badly understates the stint.
+            if (r.State == ThreatState.Impact && double.IsNaN(r.ImpactStateEnteredUT))
+            {
+                r.ImpactStateEnteredUT = r.FirstSeenUT;
+            }
             return r;
         }
 

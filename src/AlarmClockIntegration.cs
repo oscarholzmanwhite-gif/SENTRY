@@ -74,5 +74,23 @@ namespace Sentry
         {
             return id != 0 && AlarmClockScenario.AlarmExists(id);
         }
+
+        // Applies AdvancedSettings.AlarmClockWarpSafetyMultiplier onto the live stock scenario -
+        // see that field's own comment for what it controls and the overshoot-risk tradeoff.
+        // warpChangeTimeSafteyMultiplier is a plain public INSTANCE field (not wrapped in one of
+        // stock's own null-safe static methods the way CreateAlarmByType/AddAlarm/etc. are), so
+        // this needs its own Instance null-check, unlike every other method in this file. Cheap,
+        // idempotent field write - called every frame from SentryScenario.Update() (not just once)
+        // so a fresh AlarmClockScenario instance after a scene reload picks this up immediately
+        // rather than running on stock's own default (1.2) until some later trigger re-applies it.
+        public static void SyncWarpSafetyMultiplier()
+        {
+            if (AlarmClockScenario.Instance == null) return;
+            float wanted = (float)AdvancedSettings.AlarmClockWarpSafetyMultiplier;
+            if (AlarmClockScenario.Instance.warpChangeTimeSafteyMultiplier != wanted)
+            {
+                AlarmClockScenario.Instance.warpChangeTimeSafteyMultiplier = wanted;
+            }
+        }
     }
 }

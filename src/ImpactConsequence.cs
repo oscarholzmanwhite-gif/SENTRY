@@ -41,8 +41,10 @@ namespace Sentry
         public double LongitudeDeg;
 
         // home.TerrainAltitude(lat, lon, allowNegative: true) < 0 (and
-        // home.ocean true) - see Compute(). Feeds SentrySettings.oceanImpactModifierPercent into
-        // the penalty below; also read by SentryScenario to pick the report's land/ocean wording.
+        // home.ocean true) - see Compute(). Flavor-text only: read by SentryScenario to pick the
+        // report's land/ocean wording. No longer discounts the penalty below (the owner removed
+        // the ocean modifier - it made the reputation math harder to reason about) - kept computed
+        // since the land/ocean distinction is still a real, useful fact to report.
         public bool IsOcean;
 
         public double LeadTimeSeconds; // impact UT minus rec.FirstSeenUT
@@ -65,9 +67,11 @@ namespace Sentry
         // builds a display string, every draw, and must stay that way or a value would be applied
         // once per GUI repaint instead of once per real impact.
         public double WouldBeReputationDelta;
-        // Negative or 0. Applied for real via Funding.Instance.AddFunds in
-        // career mode, alongside the facility demolition FacilityDamageTier calls for - see
-        // SentryScenario.ReportConfirmedImpact. Only ever nonzero when FacilityWouldBeDamaged.
+        // Negative or 0. Computed fact only, same "nothing reads this" pattern as BypassesFloor -
+        // the owner decided damaged facilities are left destroyed for the player to repair
+        // themselves via the stock Space Center UI, at whatever cost stock itself charges, rather
+        // than SENTRY auto-deducting a computed lump sum (see SentryScenario.ReportConfirmedImpact's
+        // facility-application block). Funds/Funding is never called anywhere in this mod.
         public double WouldBeFundsDelta;
         public bool BypassesFloor;            // Class F-I catastrophic-tier flag; nothing to clamp against - no floor is implemented
     }
@@ -93,16 +97,7 @@ namespace Sentry
             ConsequenceReport report = new ConsequenceReport();
             if (rec == null || home == null) return report;
 
-            double mass;
-            if (!double.IsNaN(rec.RealMassKg) && rec.RealMassKg > 0.0)
-            {
-                // The real, per-instance generated mass, captured once by force-loading the vessel
-                // at the start of the impact-watch window (see SentryScenario.TryCaptureRealMass) -
-                // exact, not an approximation. Preferred over the nominal-sphere estimate whenever
-                // available, for both the live estimate and the final report alike.
-                mass = rec.RealMassKg;
-            }
-            else if (!TryGetMass(rec.ObjectClass, rec.IsComet, out mass))
+            if (!TryGetMassForRecord(rec, out double mass))
             {
                 return report; // Valid stays false - unrecognized class or prefab/module not found
             }
@@ -168,27 +163,87 @@ namespace Sentry
             SentrySettings settings = SentrySettings.Instance;
             double damageCoefficient = settings != null ? settings.damageCoefficient : 1.0;
             double reputationScaling = settings != null ? settings.reputationScaling : 1.0;
-            double fundsScaling = settings != null ? settings.fundsScaling : 1.0;
-            double oceanModifier = settings != null ? settings.oceanImpactModifierPercent / 100.0 : 0.30;
 
             (bool facilityDamaged, double facilityRadius, ConsequenceReport.FacilityTier facilityTier) =
-                FacilityCheck(report.EnergyKtTnt, report.LatitudeDeg, report.LongitudeDeg, settings);
+                FacilityCheck(report.EnergyKtTnt, report.LatitudeDeg, report.LongitudeDeg, settings, home);
             report.FacilityWouldBeDamaged = facilityDamaged;
             report.FacilityDamageRadiusM = facilityRadius;
             report.FacilityDamageTier = facilityTier;
 
             double basePenalty = InterpolatePenaltyTable(report.EnergyKtTnt);
-            if (report.IsOcean) basePenalty *= oceanModifier;
             double leadYears = Math.Max(0.0, report.LeadTimeSeconds) / SecondsPerYear;
             double mitigation = MitigationFactor(leadYears);
             report.WouldBeReputationDelta = -basePenalty * mitigation * reputationScaling * damageCoefficient;
             report.WouldBeFundsDelta = facilityDamaged
-                ? -AdvancedSettings.RebuildCostBaselineFunds * fundsScaling * damageCoefficient
+                ? -AdvancedSettings.RebuildCostBaselineFunds * damageCoefficient
                 : 0.0;
             report.BypassesFloor = report.EnergyKtTnt >= CatastrophicEnergyKtThreshold;
 
             report.Valid = true;
             return report;
+        }
+
+        // Shared mass lookup: prefer the real, per-instance generated mass (captured once by
+        // force-loading the vessel - see SentryScenario.TryCaptureRealMass) whenever it's
+        // available, falling back to the nominal-class estimate otherwise. Factored out of Compute()
+        // so TryEstimateNominalEnergyKt (deflection bonus) can reuse the exact same preference order
+        // without duplicating it.
+        private static bool TryGetMassForRecord(ThreatRecord rec, out double massKg)
+        {
+            if (!double.IsNaN(rec.RealMassKg) && rec.RealMassKg > 0.0)
+            {
+                massKg = rec.RealMassKg;
+                return true;
+            }
+            return TryGetMass(rec.ObjectClass, rec.IsComet, out massKg);
+        }
+
+        // Nominal "would-be" impact energy for a deflection bonus. A successfully deflected object's
+        // real orbit no longer predicts an impact at all - that's the whole point - so there's no
+        // live trajectory left to measure a precise entry speed from the way Compute() normally
+        // does. Uses the class's own real/nominal mass (TryGetMassForRecord, same preference order
+        // Compute() uses) at a fixed nominal impact speed (AdvancedSettings.NominalImpactSpeedMs,
+        // ~4 km/s - the design doc's own stated baseline: "Impact speed ~ sqrt(v_inf^2 + v_esc^2)
+        // ... ~4 km/s baseline") - this matches exactly how the deflection bonus table itself was
+        // defined (by class/nominal energy, not live per-encounter specifics), so it's the intended
+        // basis here, not an approximation of something more precise that got lost.
+        public static bool TryEstimateNominalEnergyKt(ThreatRecord rec, out double energyKt)
+        {
+            energyKt = 0.0;
+            if (!TryGetMassForRecord(rec, out double mass)) return false;
+            double speed = AdvancedSettings.NominalImpactSpeedMs;
+            energyKt = (0.5 * mass * speed * speed) / JoulesPerKtTnt;
+            return true;
+        }
+
+        // ---- Deflection bonus: single power-law formula, no offset needed -----------------------
+        // Fitted the same way the penalty curve was (least-squares in log-log space), against a
+        // table the owner supplied, calibrated to the SAME seven real energy anchors already used
+        // for the penalty curve (Class A/B/C/D/E/F/I: 0.17/0.86/4.3/17/69/300/1400 kt) with the
+        // owner's own bonus targets (+1/+3/+8/+25/+70/+120/+300 rep). Unlike the penalty curve, no
+        // offset/clamp is needed - Class A and B are meant to have small but genuinely nonzero
+        // bonuses, not flatten to 0, so a bare power law already matches the design intent with no
+        // extra terms, and "avoid multiple regions" (the owner's explicit ask) falls out for free.
+        //
+        // Verified numerically (python, least-squares fit in log-log space): k=3.4109, p=0.6418.
+        // Fit quality against the anchors: A/B/C within +-9%, F/I within +9%/+19%; D/E are the
+        // softest spots at -16%/-26% (the same "middle of the range diverges most" pattern the
+        // penalty curve's own least-squares fit showed - accepted there, accepted here for the same
+        // reason). Classes G/H have no confirmed real energy to check against, but plugging their
+        // target bonuses (+170/+230) back through the fit implies energies of ~442/~707 kt -
+        // sensibly between F's 300 kt and I's 1400 kt, a good sign the curve's shape is right even
+        // without live numbers for those two classes.
+        //
+        // No fragment-additivity constraint applies here (unlike the penalty curve) - a deflection
+        // bonus only ever pays out for an object that was successfully redirected AWAY from impact,
+        // so there's no "several fragments vs. one intact object" scenario to keep consistent.
+        private const double DeflectionCurveK = 3.4109;
+        private const double DeflectionCurveExponent = 0.6418;
+
+        public static double InterpolateDeflectionBonus(double energyKt)
+        {
+            if (energyKt <= 0.0) return 0.0;
+            return DeflectionCurveK * Math.Pow(energyKt, DeflectionCurveExponent);
         }
 
         // Final-report path: the real telemetry WatchImminentImpacts cached every frame right up
@@ -259,8 +314,7 @@ namespace Sentry
         // procedurally per-instance from a persisted seed, with +-25% radius variance
         // (ModuleAsteroid.OnStart: radius = paPrefab.radius * Random.Range(0.75, 1.25)) plus
         // further shape irregularity from the mesh generator itself. That per-instance seed only
-        // exists on a LOADED part's module, which unloaded asteroids never have (see CLAUDE.md's
-        // "Verified facts"), so replicating the exact generated volume for an arbitrary background
+        // exists on a LOADED part's module, which unloaded asteroids never have, so replicating the exact generated volume for an arbitrary background
         // object isn't practical. Instead this reads the nominal per-class prefab radius (the same
         // "Procedural/PA_<class>" / "Procedural/PC_<class>" asset stock itself loads in
         // ModuleAsteroid.OnStart/ModuleComet.OnStart, confirmed by decompiling both) and treats it
@@ -268,6 +322,7 @@ namespace Sentry
         // feature, not an attempt at exact per-instance fidelity.
 
         private static readonly Dictionary<string, double> radiusCache = new Dictionary<string, double>();
+        private static readonly HashSet<string> loggedNominalMass = new HashSet<string>();
         private static double? asteroidDensity;
         private static double? cometDensity;
 
@@ -287,14 +342,19 @@ namespace Sentry
 
             double volume = (4.0 / 3.0) * Math.PI * radius * radius * radius;
             massKg = volume * density * KgPerTonne;
-            Debug.Log(string.Format("[SENTRY] ImpactConsequence: nominal mass for class {0} ({1}) = {2:F1} kg (radius {3:F1} m, density {4:F4} t/m^3)",
-                objectClass, isComet ? "comet" : "asteroid", massKg, radius, density));
+            // Once per class/kind: this runs from the AlertWindow's live estimate on every IMGUI
+            // pass (twice a frame), which produced ~69,000 identical lines in one test session.
+            if (loggedNominalMass.Add((isComet ? "PC_" : "PA_") + objectClass))
+            {
+                Debug.Log(string.Format("[SENTRY] ImpactConsequence: nominal mass for class {0} ({1}) = {2:F1} kg (radius {3:F1} m, density {4:F4} t/m^3)",
+                    objectClass, isComet ? "comet" : "asteroid", massKg, radius, density));
+            }
             return massKg > 0.0;
         }
 
         // Live read of ModuleAsteroid.density / ModuleComet.density off the loaded part prefab -
         // never hardcoded, so an independent MM patch multiplying density (planned separately, not
-        // part of this mod) is picked up automatically with zero coordination, per CLAUDE.md's
+        // part of this mod) is picked up automatically with zero coordination, per the
         // "mass must be read at runtime" rule. Cached once per process lifetime - prefabs don't
         // change after load. Note ModuleComet does NOT derive from ModuleAsteroid (confirmed by
         // decompiling both - each extends PartModule directly with its own separate `density`
@@ -414,7 +474,7 @@ namespace Sentry
             double rhoI = massKg / Math.Max(1.0, (4.0 / 3.0) * Math.PI * bodyRadiusM * bodyRadiusM * bodyRadiusM);
             double rho0 = home.GetDensity(home.GetPressure(0.0), home.GetTemperature(0.0));
             double cd = AdvancedSettings.DragCoefficient;
-            double h_ = AdvancedSettings.AtmosphereScaleHeightM;
+            double h_ = EstimateScaleHeightM(home);
 
             double l = 2.0 * bodyRadiusM * sinTheta * Math.Sqrt(rhoI / (cd * Math.Max(1e-12, rho0)))
                 * Math.Exp(zStar / (2.0 * h_));
@@ -501,10 +561,59 @@ namespace Sentry
             return speed;
         }
 
+        // Derives the local exponential atmosphere scale height (P(h) = P(0) * exp(-h/H), so
+        // H = (h2-h1) / ln(P1/P2)) from the ACTUAL home body's own pressure profile, rather than
+        // assuming Kerbin's ~5,600 m regardless of what body is actually loaded - CLAUDE.md's own
+        // "never hardcode Kerbin, read FlightGlobals.GetHomeBody()" rule (see "Home world"), which
+        // this constant was quietly violating for any planet pack (RSS, JNSQ, GPP, ...) that
+        // changes the home body's atmosphere. Sampled at 0 and 30% of atmosphereDepth - well inside
+        // the atmosphere, away from the near-vacuum edge where the real (non-analytic) pressure
+        // curve can depart from a clean exponential and make a two-point log-ratio noisy. Falls
+        // back to AdvancedSettings.AtmosphereScaleHeightM (the old hardcoded stock-Kerbin value)
+        // only if the body's own pressure data is degenerate (e.g. p1 <= p2, which would make the
+        // log-ratio zero or negative) - kept as a safety net, not the primary source anymore.
+        //
+        // NOTE on verifying this offline: decompiling CelestialBody.GetPressure shows Kerbin's real
+        // pressure model could be EITHER the analytic lapse-rate formula OR a baked, normalized
+        // FloatCurve (atmosphereUsePressureCurve/atmospherePressureCurveIsNormalized) - which one,
+        // and that curve's exact keyframes, are per-body serialized data compiled into the game's
+        // own assets, not readable from decompiled code or any plain-text .cfg. So there's no
+        // trustworthy way to sanity-check this against real Kerbin numbers in a standalone
+        // script - only the live game actually knows. loggedOnce below prints the real derived
+        // value (and the two raw pressures it came from) to KSP.log the first time this runs for
+        // real, so the next in-game session is the actual verification, same pattern already used
+        // for TryGetMass/TryCaptureRealMass elsewhere in this file.
+        private static bool loggedScaleHeightOnce;
+
+        private static double EstimateScaleHeightM(CelestialBody home)
+        {
+            if (home == null || !home.atmosphere || home.atmosphereDepth <= 0.0)
+                return AdvancedSettings.AtmosphereScaleHeightM;
+
+            double h1 = 0.0;
+            double h2 = home.atmosphereDepth * 0.3;
+            double p1 = home.GetPressure(h1);
+            double p2 = home.GetPressure(h2);
+            if (p1 <= 0.0 || p2 <= 0.0 || p1 <= p2) return AdvancedSettings.AtmosphereScaleHeightM;
+
+            double h = (h2 - h1) / Math.Log(p1 / p2);
+            if (h <= 0.0) return AdvancedSettings.AtmosphereScaleHeightM;
+
+            if (!loggedScaleHeightOnce)
+            {
+                loggedScaleHeightOnce = true;
+                Debug.Log(string.Format(
+                    "[SENTRY] ImpactConsequence: derived atmosphere scale height for {0} = {1:F0} m " +
+                    "(P({2:F0} m) = {3:F2} kPa, P({4:F0} m) = {5:F2} kPa; fallback constant is {6:F0} m)",
+                    home.bodyName, h, h1, p1, h2, p2, AdvancedSettings.AtmosphereScaleHeightM));
+            }
+            return h;
+        }
+
         // ---- Facility check: energy band decides both the damage radius AND how much of KSC ----
         // ---- a hit within that radius would plausibly take out (SentryScenario applies it). -----
         private static (bool damaged, double radiusM, ConsequenceReport.FacilityTier tier) FacilityCheck(
-            double energyKt, double latDeg, double lonDeg, SentrySettings settings)
+            double energyKt, double latDeg, double lonDeg, SentrySettings settings, CelestialBody home)
         {
             if (settings != null && !settings.facilityDestructionEnabled)
                 return (false, 0.0, ConsequenceReport.FacilityTier.None);
@@ -533,19 +642,27 @@ namespace Sentry
             }
 
             if (baseRadius <= 0.0) return (false, 0.0, ConsequenceReport.FacilityTier.None);
-            double radius = baseRadius * AdvancedSettings.AtmosphereThinnessMultiplier;
 
-            double distance = SurfaceDistance(latDeg, lonDeg, AdvancedSettings.KscLatitudeDeg, AdvancedSettings.KscLongitudeDeg);
+            // AtmosphereThinnessMultiplier is a Kerbin-vs-EARTH comparison ("Kerbin's atmosphere is
+            // thinner than Earth's, so blast energy couples to the ground more efficiently" - see
+            // AdvancedSettings' own comment), not a derivable physical fact about an arbitrary body
+            // the way EstimateScaleHeightM above is - there's no principled way to generalize "how
+            // much thinner than Earth" to a planet pack's own home body. Gated to stock Kerbin
+            // specifically (by name, same category of approximation this file already accepts for
+            // the hardcoded KSC lat/long below) rather than applied blindly everywhere; a different
+            // home body gets no correction (multiplier 1.0) rather than an arbitrary, unjustified one.
+            bool isKerbin = home != null && home.bodyName == "Kerbin";
+            double thinnessMultiplier = isKerbin ? AdvancedSettings.AtmosphereThinnessMultiplier : 1.0;
+            double radius = baseRadius * thinnessMultiplier;
+
+            double distance = SurfaceDistance(latDeg, lonDeg, AdvancedSettings.KscLatitudeDeg, AdvancedSettings.KscLongitudeDeg, home);
             bool damaged = distance <= radius;
             return (damaged, radius, damaged ? tier : ConsequenceReport.FacilityTier.None);
         }
 
-        private static double SurfaceDistance(double lat1Deg, double lon1Deg, double lat2Deg, double lon2Deg)
+        private static double SurfaceDistance(double lat1Deg, double lon1Deg, double lat2Deg, double lon2Deg, CelestialBody home)
         {
-            // Haversine great-circle angular distance, scaled by the home body's own radius
-            // (deliberately not passed in - this is only ever compared against a radius already in
-            // metres, and the caller's home body is always the one KSC actually sits on).
-            CelestialBody home = FlightGlobals.GetHomeBody();
+            // Haversine great-circle angular distance, scaled by the home body's own radius.
             double bodyRadius = home != null ? home.Radius : 600000.0;
 
             double phi1 = lat1Deg * Math.PI / 180.0;
