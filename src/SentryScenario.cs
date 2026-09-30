@@ -1392,8 +1392,53 @@ namespace Sentry
             // (NearPass -> NearPass etc.) with the flag set pays out once guard 4 passes; and
             // re-entering Impact should clear it.
             // I'm just gonna nest `if`s. There's probably a more efficient structure, but see note on C#.
-            // Check 1
             string homeName = homeBody != null ? homeBody.name : "the home body";
+            if (newState != ThreatState.Impact)
+            {
+                if (rec.CapturePeA > result.ThresholdAltitude + AdvancedSettings.DeflectionMinPeriapsisMarginM && rec.DeflectionAwaitingClearance)
+                {
+                    if (ImpactConsequence.TryEstimateNominalEnergyKt(rec, out double energyKt))
+                    {
+                        double bonus = 0;
+                        bonus = ImpactConsequence.InterpolateDeflectionBonus(energyKt);
+                        bonus *= SentrySettings.Instance.damageCoefficient;
+                        // I guess C# only evaluates the second thing in an && after the first is true. I could've used that above.
+                        bool isCareer = HighLogic.CurrentGame != null && HighLogic.CurrentGame.Mode == Game.Modes.CAREER;
+                        // Not sure if the if is in the right spot
+                        if (isCareer && Reputation.Instance != null)
+                        {
+                            // The instructions said to EXACTLY follow the pattern from ReportConfirmedImpact
+                            float ceiling = Reputation.RepRange;
+                            float remainingBudget = ceiling - Reputation.CurrentRep;
+                            // Not sure how this could happen
+                            if (remainingBudget <= 0f)
+                            {
+                                bonus = 0;
+                            }
+                            // Don't account for diminishing returns
+                            else if (bonus > remainingBudget)
+                            {
+                                bonus = remainingBudget;
+                            }
+                            if (bonus != 0)
+                            {
+                                // Last minute cast to `float`
+                                Reputation.Instance.AddReputation((float)bonus, TransactionReasons.None);
+                            }
+                        }
+                        rec.HasPaidDeflection = true;
+                        // I feel like someone piloting a vessel who redirects an asteroid might still want the screen notification with how much rep they earned since there are very few other occasions when a redirect might occur. I might have something wrong, though. Please push back if you disagree.
+                        // I probably messed the `AlertLog.Alert` syntax up
+                        AlertLog.Alert(Localizer.Format("#SENTRY_title_deflectionSuccess"), Localizer.Format("#SENTRY_msg_deflectionSuccess", label, homeName, bonus.ToString("F0")), severe: false, stopWarpEligible: false);
+                        return true;
+                    }
+                }
+            }
+            else
+            {
+                rec.DeflectionAwaitingClearance = false;
+            }
+            // Check 1
             if (oldState == ThreatState.Impact && newState != ThreatState.Impact)
             {
                 // Check 2
@@ -1402,49 +1447,12 @@ namespace Sentry
                     // Check 3
                     if (now - rec.ImpactStateEnteredUT > AdvancedSettings.DeflectionMinDwellSeconds)
                     {
-                        // Check 4
-                        // A rock nudged from 69km to 71km is technically deflected, though. And it's not clear that a rock with a pe of 69km is a threat that needs deflecting, either. This might need more thought.
-                        if (rec.CapturePeA > result.ThresholdAltitude + AdvancedSettings.DeflectionMinPeriapsisMarginM)
+                        // Check 5
+                        if (!rec.HasPaidDeflection)
                         {
-                            // Check 5
-                            double bonus = 0;
-                            if (!rec.HasPaidDeflection)
-                            {
-                                if (ImpactConsequence.TryEstimateNominalEnergyKt(rec, out double energyKt))
-                                {
-                                    bonus = ImpactConsequence.InterpolateDeflectionBonus(energyKt);
-                                    bonus *= SentrySettings.Instance.damageCoefficient;
-                                    // I guess C# only evaluates the second thing in an && after the first is true. I could've used that above.
-                                    bool isCareer = HighLogic.CurrentGame != null && HighLogic.CurrentGame.Mode == Game.Modes.CAREER;
-                                    // Not sure if the if is in the right spot
-                                    if (isCareer && Reputation.Instance != null)
-                                    {
-                                        // The instructions said to EXACTLY follow the pattern from ReportConfirmedImpact
-                                        float ceiling = Reputation.RepRange;
-                                        float remainingBudget = ceiling - Reputation.CurrentRep;
-                                        // Not sure how this could happen
-                                        if (remainingBudget <= 0f)
-                                        {
-                                            bonus = 0;
-                                        }
-                                        // Don't account for diminishing returns
-                                        else if (bonus > remainingBudget)
-                                        {
-                                            bonus = remainingBudget;
-                                        }
-                                        if (bonus != 0)
-                                        {
-                                            // Last minute cast to `float`
-                                            Reputation.Instance.AddReputation((float)bonus, TransactionReasons.None);
-                                        }
-                                    }
-                                    rec.HasPaidDeflection = true;
-                                    // I feel like someone piloting a vessel who redirects an asteroid might still want the screen notification with how much rep they earned since there are very few other occasions when a redirect might occur. I might have something wrong, though. Please push back if you disagree.
-                                    // I probably messed the `AlertLog.Alert` syntax up
-                                    AlertLog.Alert(Localizer.Format("#SENTRY_title_deflectionSuccess"), Localizer.Format("#SENTRY_msg_deflectionSuccess", label, homeName, bonus.ToString("F0")), severe: false, stopWarpEligible: false);
-                                    return true;
-                                }
-                            }
+                            // Check 4
+                            // A rock nudged from 69km to 71km is technically deflected, though. And it's not clear that a rock with a pe of 69km is a threat that needs deflecting, either. This might need more thought.
+                            rec.DeflectionAwaitingClearance = true;
                         }
                     }
                 }
