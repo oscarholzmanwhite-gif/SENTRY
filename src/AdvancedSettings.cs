@@ -51,19 +51,6 @@ namespace Sentry
         // reuses those exact same energy anchors) is measuring against a consistent baseline.
         public static double NominalImpactSpeedMs = 4000.0;
 
-        // Minimum time (game-seconds) a record must have continuously held ThreatState.Impact
-        // before a deflection out of it can pay a bonus - the design doc's own "at least two scans"
-        // anti-flicker guard, so an object oscillating in and out of Impact during ordinary orbit
-        // refinement can't repeatedly (mis)trigger the reward. ~2x ScanIntervalSeconds (3 game
-        // hours) by default.
-        public static double DeflectionMinDwellSeconds = 21600.0;
-
-        // Minimum clearance (m) a deflected object's new periapsis must have above the impact
-        // threshold altitude (atmosphere top / surface) before it counts as genuinely "cleared,"
-        // not just nudged from e.g. 69 km to 71 km - the design doc's own explicit example of what
-        // should NOT count. Hand-tune if 5 km feels too strict or too lenient once tested.
-        public static double DeflectionMinPeriapsisMarginM = 5000.0;
-
         // Real-time rescan cadence (s) while a captured rock's vessel is loaded. The normal scan
         // runs every 3 in-game hours, which at 1x warp (i.e. while the player is flying the rock)
         // is 3 real hours - so a deflection burn's Impact -> NearPass change went unnoticed until
@@ -83,12 +70,17 @@ namespace Sentry
         // Collins-Melosh-Marcus dispersion length (see ImpactConsequence.BurstAltitude).
         public static double DragCoefficient = 1.3;
 
-        // Threshold constant (alpha) in the pancake-model airburst-altitude closed form: z_b = z* -
-        // 2H * ln(1 + (l / 2H) * sqrt(-ln(alpha))). Collins, Melosh & Marcus (2005), "Earth Impact
-        // Effects Program," Meteoritics & Planetary Science 40, 817-840 (see also the Appendix of
-        // Collins et al.'s 2017 "A numerical assessment of simple airblast models of impact
-        // airbursts," same journal, which reproduces the ablative pancake-model equations A11-A18).
-        public static double BurstDispersionAlpha = 0.001;
+        // Pancake factor f_p: how many times its original width the breaking-up debris cloud spreads
+        // before it counts as "burst". Collins, Melosh & Marcus (2005), "Earth Impact Effects
+        // Program," Meteoritics & Planetary Science 40, 817-840, use 7 (good Tunguska-class fits for
+        // 5-10; Collins et al. 2017 fit Chelyabinsk with 5-6). The burst altitude comes from setting
+        // the cloud width L(z) = L0 * sqrt(1 + (2H/l)^2 * (exp((z*-z)/2H) - 1)^2) (Collins et al.
+        // 2017, "A numerical assessment of simple airblast models of impact airbursts", same
+        // journal, eq. A16) equal to f_p * L0: z_b = z* - 2H * ln(1 + (l/2H) * sqrt(f_p^2 - 1)).
+        // Replaced an earlier "alpha" constant (sqrt(-ln(0.001)) ~ 2.6 in place of sqrt(48) ~ 6.9)
+        // that came from a garbled transcription of the paper and put mid-size bursts several km
+        // too high - see "Burst altitude formula corrected". Must be > 1.
+        public static double PancakeFactor = 7.0;
 
         // FALLBACK ONLY (~5,600 m, stock Kerbin's real value, vs Earth's ~8,500 m) - as of this
         // pass, ImpactConsequence.EstimateScaleHeightM derives the real value live from the actual
@@ -229,12 +221,10 @@ namespace Sentry
                 node.TryGetValue("firstScanDelayRealSeconds", ref FirstScanDelayRealSeconds);
                 node.TryGetValue("impactSurfaceSpeedCutoffMs", ref ImpactSurfaceSpeedCutoffMs);
                 node.TryGetValue("nominalImpactSpeedMs", ref NominalImpactSpeedMs);
-                node.TryGetValue("deflectionMinDwellSeconds", ref DeflectionMinDwellSeconds);
-                node.TryGetValue("deflectionMinPeriapsisMarginM", ref DeflectionMinPeriapsisMarginM);
                 node.TryGetValue("capturedRescanRealSeconds", ref CapturedRescanRealSeconds);
                 node.TryGetValue("rubblePileStrengthPa", ref RubblePileStrengthPa);
                 node.TryGetValue("dragCoefficient", ref DragCoefficient);
-                node.TryGetValue("burstDispersionAlpha", ref BurstDispersionAlpha);
+                node.TryGetValue("pancakeFactor", ref PancakeFactor);
                 node.TryGetValue("atmosphereScaleHeightM", ref AtmosphereScaleHeightM);
                 node.TryGetValue("atmosphereThinnessMultiplier", ref AtmosphereThinnessMultiplier);
                 node.TryGetValue("airburstAltitudeThresholdM", ref AirburstAltitudeThresholdM);
@@ -275,12 +265,10 @@ namespace Sentry
                 node.AddValue("firstScanDelayRealSeconds", FirstScanDelayRealSeconds);
                 node.AddValue("impactSurfaceSpeedCutoffMs", ImpactSurfaceSpeedCutoffMs);
                 node.AddValue("nominalImpactSpeedMs", NominalImpactSpeedMs);
-                node.AddValue("deflectionMinDwellSeconds", DeflectionMinDwellSeconds);
-                node.AddValue("deflectionMinPeriapsisMarginM", DeflectionMinPeriapsisMarginM);
                 node.AddValue("capturedRescanRealSeconds", CapturedRescanRealSeconds);
                 node.AddValue("rubblePileStrengthPa", RubblePileStrengthPa);
                 node.AddValue("dragCoefficient", DragCoefficient);
-                node.AddValue("burstDispersionAlpha", BurstDispersionAlpha);
+                node.AddValue("pancakeFactor", PancakeFactor);
                 node.AddValue("atmosphereScaleHeightM", AtmosphereScaleHeightM);
                 node.AddValue("atmosphereThinnessMultiplier", AtmosphereThinnessMultiplier);
                 node.AddValue("airburstAltitudeThresholdM", AirburstAltitudeThresholdM);

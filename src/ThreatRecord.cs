@@ -52,12 +52,26 @@ namespace Sentry
         public double ValidUntilUT;
 
         public double FirstSeenUT;
+
+        // When the stock game spawned this object - Vessel.launchTime ("lct" in the save), set once
+        // by ProtoVessel.CreateVesselNode at spawn and never touched by tracking/untracking (unlike
+        // DiscoveryInfo.lastObservedTime, which StopTrackingObject resets to "now"). A spawned
+        // object is discovered at spawn (DiscoveryLevels.Presence, visible in the Tracking Station),
+        // so this is the moment the player could first have known about it - with or without
+        // SENTRY installed. Unlike FirstSeenUT, it predates a mid-save install. NaN until read
+        // from the live vessel (SentryScenario.ScanRoutine backfills it), and never read off a
+        // captured record's vessel, whose launchTime may be the grappling ship's.
+        public double SpawnUT = double.NaN;
         public double LastEvaluatedUT;
         public double LastChangeUT;
 
         public string ObjectClass = ""; // A..I
         public bool IsComet;
         public string CometType = "";   // e.g. "short", "long", "interstellar"; empty for asteroids
+        // Lifetime latch for the one-time "interstellar comet discovered" message (see
+        // SentryScenario.CheckInterstellarDiscovery). Also pre-set on breakup fragments, which
+        // inherit the parent's comet type but aren't a new discovery.
+        public bool InterstellarAlertFired;
         public bool AutoTracked;        // true if the mod (not the player) pressed Track on it
 
         // True while this object is clawed onto (or otherwise merged with) a player craft - see
@@ -83,24 +97,22 @@ namespace Sentry
         // threat showed up" interrupt.
         public bool DiscoveryWarpStopped;
 
-        // Deflection bonus bookkeeping (see SentryScenario.ApplyResult's deflection-check hook,
-        // still under construction as of this writing - see CLAUDE.md). HasPaidDeflection is a
-        // lifetime latch: once true, this object can never pay the bonus again, no matter how many
-        // more times it flickers into and out of Impact state - the design doc's explicit anti-farm
-        // guard (bonus once, penalty always, asymmetric on purpose). ImpactStateEnteredUT is NOT a
-        // lifetime latch like DiscoveryWarpStopped - it's meant to be reset to NaN on every exit
-        // from Impact and re-set to the current UT on every FRESH entry, so the minimum-dwell guard
-        // restarts for each new stint rather than being satisfied once and then never checked again.
+        // Deflection bonus bookkeeping (see SentryScenario.CheckDeflectionBonus). Both are lifetime
+        // latches, never reset. HasPaidDeflection: once true, this object can never pay the bonus
+        // again - the design doc's anti-farm guard (bonus once, penalty always, asymmetric on
+        // purpose). WasNaturalImpactor: set by ApplyResult whenever a prediction says this object
+        // will hit the ground (IsGroundImpact, periapsis below the surface) AND it is still
+        // undisturbed - not captured, and not stock-"disturbed" (DiscoveryInfo.Level == Owned, see
+        // SentryScenario.IsDisturbed). A rock the player pushed onto an impact course therefore
+        // never qualifies; one that was already inbound before they touched it keeps the flag
+        // through capture and deflection. Only an object that was
+        // once a natural ground impactor can pay, and only once it's fully clear of the atmosphere
+        // (state no longer Impact) - so the whole atmosphere acts as the jitter buffer between "was
+        // a threat" and "is deflected", and a grazer that just flies past as predicted never pays.
+        // Sticky rather than "previous state was Impact" so a two-stage deflection (impactor ->
+        // grazer -> clear) still pays on the second step.
         public bool HasPaidDeflection;
-        public double ImpactStateEnteredUT = double.NaN;
-
-        // Set when a record makes a genuine exit from Impact (epoch changed, dwell met, not already
-        // paid) but its new periapsis hasn't yet cleared DeflectionMinPeriapsisMarginM. Needed
-        // because a continuous burn is caught by the ~1 s captured-rock rescan the instant
-        // periapsis crosses the threshold - i.e. with essentially zero margin - and every later
-        // scan is NearPass -> NearPass, so a check made only at the moment of exit could never
-        // pass. Persisted, so a deflection finished across a save/load still counts.
-        public bool DeflectionAwaitingClearance;
+        public bool WasNaturalImpactor;
 
         // Last altitude/surface-relative speed observed for this vessel while it was still
         // findable (see SentryScenario.WatchImminentImpacts), used to tell a genuine
@@ -216,19 +228,20 @@ namespace Sentry
             node.AddValue("referenceBody", ReferenceBody);
             node.AddValue("validUntilUT", Fmt(ValidUntilUT));
             node.AddValue("firstSeenUT", Fmt(FirstSeenUT));
+            node.AddValue("spawnUT", Fmt(SpawnUT));
             node.AddValue("lastEvaluatedUT", Fmt(LastEvaluatedUT));
             node.AddValue("lastChangeUT", Fmt(LastChangeUT));
             node.AddValue("objectClass", ObjectClass);
             node.AddValue("isComet", IsComet);
             node.AddValue("cometType", CometType);
+            node.AddValue("interstellarAlertFired", InterstellarAlertFired);
             node.AddValue("autoTracked", AutoTracked);
             node.AddValue("captured", Captured);
             node.AddValue("alarmId", AlarmId);
             node.AddValue("imminentAlertFired", ImminentAlertFired);
             node.AddValue("discoveryWarpStopped", DiscoveryWarpStopped);
             node.AddValue("hasPaidDeflection", HasPaidDeflection);
-            node.AddValue("impactStateEnteredUT", Fmt(ImpactStateEnteredUT));
-            node.AddValue("deflectionAwaitingClearance", DeflectionAwaitingClearance);
+            node.AddValue("wasNaturalImpactor", WasNaturalImpactor);
         }
 
         public static ThreatRecord Load(ConfigNode node)
@@ -257,28 +270,25 @@ namespace Sentry
             node.TryGetValue("referenceBody", ref r.ReferenceBody);
             r.ValidUntilUT = ReadDouble(node, "validUntilUT");
             r.FirstSeenUT = ReadDouble(node, "firstSeenUT");
+            r.SpawnUT = ReadDouble(node, "spawnUT");
             r.LastEvaluatedUT = ReadDouble(node, "lastEvaluatedUT");
             r.LastChangeUT = ReadDouble(node, "lastChangeUT");
             node.TryGetValue("objectClass", ref r.ObjectClass);
             node.TryGetValue("isComet", ref r.IsComet);
             node.TryGetValue("cometType", ref r.CometType);
+            node.TryGetValue("interstellarAlertFired", ref r.InterstellarAlertFired);
             node.TryGetValue("autoTracked", ref r.AutoTracked);
             node.TryGetValue("captured", ref r.Captured);
             node.TryGetValue("alarmId", ref r.AlarmId);
             node.TryGetValue("imminentAlertFired", ref r.ImminentAlertFired);
             node.TryGetValue("discoveryWarpStopped", ref r.DiscoveryWarpStopped);
             node.TryGetValue("hasPaidDeflection", ref r.HasPaidDeflection);
-            r.ImpactStateEnteredUT = ReadDouble(node, "impactStateEnteredUT");
-            node.TryGetValue("deflectionAwaitingClearance", ref r.DeflectionAwaitingClearance);
-            // Migration: a record already in Impact from a save written before this field existed
-            // (or one that never freshly re-entered Impact since) has no stint start, and NaN fails
-            // every dwell comparison, silently blocking the deflection bonus forever. FirstSeenUT,
-            // not LastChangeUT: the latter is bumped by every >1 h impact-time revision, which a
-            // captured craft being flown triggers constantly, so it badly understates the stint.
-            if (r.State == ThreatState.Impact && double.IsNaN(r.ImpactStateEnteredUT))
-            {
-                r.ImpactStateEnteredUT = r.FirstSeenUT;
-            }
+            node.TryGetValue("wasNaturalImpactor", ref r.WasNaturalImpactor);
+            // Migration: a save written before this field existed (or under its earlier name,
+            // wasGroundImpactor, which didn't check for disturbance) has no trustworthy value, but
+            // a loose record whose last saved prediction was a ground impact qualifies. Captured
+            // records are skipped - we can't tell if the impact course predates the capture.
+            if (!node.HasValue("wasNaturalImpactor") && r.IsGroundImpact && !r.Captured) r.WasNaturalImpactor = true;
             return r;
         }
 

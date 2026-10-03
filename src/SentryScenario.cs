@@ -66,7 +66,24 @@ namespace Sentry
         }
 
         private readonly Dictionary<Guid, ThreatRecord> records = new Dictionary<Guid, ThreatRecord>();
+
+        // Comet breakup fragments seen by OnCometSpawned whose records don't exist yet (the record
+        // is only created on the next scan). Consumed by ApplyResult when it creates the record.
+        // Not persisted: OnCometSpawned requests a scan immediately, so this never outlives a scene.
+        private readonly HashSet<Guid> pendingFragmentIds = new HashSet<Guid>();
         private double lastScanUT = double.NegativeInfinity;
+
+        // When SENTRY first started watching this save, for the mid-save install grace (see
+        // ImpactConsequence.Compute's lead-time line). Stock keeps no such record, so it's ours,
+        // persisted in this scenario's node as "installUT". NaN until known:
+        //  - a save that already has it: loaded in OnLoad;
+        //  - a save that predates this field but already ran SENTRY: OnLoad estimates it as the
+        //    earliest FirstSeenUT among existing records (when SENTRY first saw anything here) -
+        //    stamping "now" would wrongly grant grace to everything currently inbound;
+        //  - a genuinely fresh install: set on the first Update(), from the live clock (not in
+        //    OnLoad, which may not run at all when the save has no SENTRY node yet).
+        private double installUT = double.NaN;
+        public double InstallUT { get { return installUT; } }
         private float lastScanRealTime = float.NegativeInfinity;
         private bool scanRunning;
         private bool scanRequested;
@@ -165,6 +182,7 @@ namespace Sentry
             char suffix = name[name.Length - 1];
             if (suffix < 'A' || suffix > 'Z') return;
             string parentName = name.Substring(0, name.Length - 2);
+            pendingFragmentIds.Add(v.id);
 
             foreach (ThreatRecord candidate in records.Values)
             {
@@ -258,6 +276,57 @@ namespace Sentry
             }
         }
 
+        // Stock's own definition of a "disturbed" asteroid, copied from the asteroid-contract
+        // check (FinePrint AsteroidParameter, decompiled): DiscoveryInfo.Level == Owned. A spawned
+        // rock is given an explicit Presence/Name/... level; a vessel created any other way -
+        // including a rock split off by releasing it from a claw - gets the DiscoveryInfo
+        // constructor's default, Owned. So a released rock comes back as a fresh record that
+        // reads as disturbed forever, which is exactly what stops "grab it, push it onto an
+        // impact course, let go, then deflect it" from earning a bonus.
+        // Vessel.launchTime is the stock spawn UT for a spawned space object - see
+        // ThreatRecord.SpawnUT. Anything non-positive is treated as unknown rather than "spawned at
+        // UT 0", which would hand out a huge, unearned lead time.
+        private static double ReadSpawnUT(Vessel v)
+        {
+            return v != null && v.launchTime > 0.0 ? v.launchTime : double.NaN;
+        }
+
+        // Whether this save can see asteroids/comets at all, by stock's own rule: the stock spawner
+        // (ScenarioDiscoverableObjects.UpdateSpaceObjects) does nothing unless
+        // GameVariables.UnlockedSpaceObjectDiscovery(Tracking Station level) - decompiled:
+        // normalized level > 0.6, i.e. a level-3 Tracking Station. Consequences are gated on it so
+        // that a player who can't see these objects is never charged for them (relevant under
+        // Kopernicus/Custom Asteroids, whose spawners ignore this rule; under stock nothing spawns
+        // below level 3 at all). Alerts are deliberately NOT gated - never infer "no
+        // asteroids exist" from TS level, since those spawners can still produce real threats.
+        public static bool SpaceObjectDiscoveryUnlocked
+        {
+            get
+            {
+                return GameVariables.Instance == null || GameVariables.Instance.UnlockedSpaceObjectDiscovery(
+                    ScenarioUpgradeableFacilities.GetFacilityLevel(SpaceCenterFacility.TrackingStation));
+            }
+        }
+
+        // One-time "interstellar comet discovered" message. Stock's own comet-type label, read off
+        // the CometVessel module's typeName (CometDefs.cfg: short/intermediate/long/interstellar) -
+        // not inferred from eccentricity, which false-positives on gravity-assisted ejections.
+        // Non-severe: a rare-and-interesting notice, not a threat (an actual impact course still
+        // gets its own alert), so it goes to the screen and message inbox but never stops warp.
+        private void CheckInterstellarDiscovery(ThreatRecord rec, string label)
+        {
+            if (rec.InterstellarAlertFired || !rec.IsComet || rec.CometType != "interstellar") return;
+            rec.InterstellarAlertFired = true;
+            AlertLog.Alert(Localizer.Format("#SENTRY_title_interstellarComet"),
+                Localizer.Format("#SENTRY_msg_interstellarComet", label),
+                severe: false, stopWarpEligible: false);
+        }
+
+        private static bool IsDisturbed(Vessel v)
+        {
+            return v.DiscoveryInfo != null && v.DiscoveryInfo.Level == DiscoveryLevels.Owned;
+        }
+
         // True if this vessel still physically contains an asteroid or comet part. Used to decide
         // when a captured record stops being one: once the rock is released (undocked/decoupled) or
         // its part is destroyed, the host craft is of no further interest, and a released rock
@@ -331,6 +400,22 @@ namespace Sentry
                 ThreatRecord r = ThreatRecord.Load(child);
                 if (r != null) records[r.VesselId] = r;
             }
+            installUT = double.NaN;
+            string installStr = "";
+            if (node.TryGetValue("installUT", ref installStr))
+            {
+                double.TryParse(installStr, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out installUT);
+            }
+            else
+            {
+                // Migration estimate - see installUT's comment. Stays NaN with no records, and
+                // Update() then stamps the current time.
+                foreach (ThreatRecord r in records.Values)
+                {
+                    if (!double.IsNaN(r.FirstSeenUT) && !(r.FirstSeenUT >= installUT)) installUT = r.FirstSeenUT;
+                }
+            }
             Debug.Log(string.Format("[SENTRY] Scenario loaded: {0} records, lastScanUT={1:F0}", records.Count, lastScanUT));
         }
 
@@ -341,6 +426,10 @@ namespace Sentry
             node.AddValue("stopWarpEnabled", stopWarpEnabled);
             node.AddValue("useAlarmClockEnabled", useAlarmClockEnabled);
             node.AddValue("pendingFacilityTier", (int)pendingFacilityTier);
+            if (!double.IsNaN(installUT))
+            {
+                node.AddValue("installUT", installUT.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+            }
             foreach (ThreatRecord r in records.Values)
             {
                 r.Save(node.AddNode("THREAT"));
@@ -353,6 +442,8 @@ namespace Sentry
             // own comment for what this controls (how snappy the stock Alarm Clock's warp ramp-down
             // feels) and why it has to run every frame rather than once.
             AlarmClockIntegration.SyncWarpSafetyMultiplier();
+
+            if (double.IsNaN(installUT)) installUT = Planetarium.GetUniversalTime();
 
             // Only ever anything to do here in the Space Center scene, where DestructibleBuilding
             // GameObjects actually exist - see pendingFacilityTier's own comment. Runs every frame
@@ -477,11 +568,30 @@ namespace Sentry
                 // disappears, SENTRY doesn't catch it"). HasSpaceObjectPart (already used by
                 // ScanRoutine's own much slower per-scan version of this same check) catches both
                 // this case and a deliberate release/undock (which spins the rock off as a
-                // brand-new vessel with its own Guid, rediscovered fresh next scan) - collapsing
-                // either into "gone" here is safe because ReportConfirmedImpact's own evidence
-                // checks (telemetry / WasInAtmosphere / HasLanded) already correctly read a benign
-                // release as "uncertain," never a false confirmed impact.
-                if (rec.Captured && v != null && !HasSpaceObjectPart(v)) v = null;
+                // brand-new vessel with its own Guid, rediscovered fresh next scan). The two are
+                // told apart by where the craft is when the rock leaves it - see below.
+                if (rec.Captured && v != null && !HasSpaceObjectPart(v))
+                {
+                    // The host craft survived, so it can still say where the rock left it. Outside
+                    // the home body's atmosphere that can only be a release (or something unrelated
+                    // to an impact) - log it and drop the record quietly rather than running the
+                    // confirmed-impact check, which would post an "uncertain impact" alert for a rock
+                    // the player just let go of far out in space. Uses the craft's live atmDensity
+                    // (FlightIntegrator sets it every physics tick for a loaded vessel, and a part
+                    // can only leave a loaded one), deliberately NOT rec.WasInAtmosphere: that flag is
+                    // sticky, so a rock that once aerobraked and was released later would be read as
+                    // a confirmed impact by ReportConfirmedImpact's atmosphere fallback.
+                    if (v.mainBody != home || v.atmDensity <= 0.0)
+                    {
+                        AlertLog.Info(string.Format("{0} is no longer attached to {1} outside the atmosphere (released); record dropped - it will be rediscovered as a new object.",
+                            Describe(rec), v.vesselName));
+                        DisarmAlarm(rec);
+                        if (confirmedGone == null) confirmedGone = new List<Guid>();
+                        confirmedGone.Add(rec.VesselId);
+                        continue;
+                    }
+                    v = null;
+                }
 
                 // A landed/splashed object has already resolved - whatever happened (a hard
                 // landing, a player-executed soft landing/redirect), it's sitting still, not
@@ -804,8 +914,18 @@ namespace Sentry
                             surfaceDesc,
                             report.LatitudeDeg.ToString("F1"),
                             report.LongitudeDeg.ToString("F1"),
-                            (report.LeadTimeSeconds / 86400.0).ToString("F1"),
-                            Math.Abs(report.WouldBeReputationDelta).ToString("F0"));
+                            (report.LeadTimeSeconds / 86400.0).ToString("F1"));
+                        // The reputation sentence is its own fragment so its wording can change when
+                        // the player has turned penalties off: still quoted, as what it would have
+                        // cost (same treatment as a disabled deflection bonus in CheckDeflectionBonus).
+                        // A Tracking Station too low to see space objects at all also withholds the
+                        // penalty (see SpaceObjectDiscoveryUnlocked), with its own wording.
+                        bool penaltiesEnabled = SentrySettings.ReputationPenaltiesEnabled;
+                        bool discoveryUnlocked = SpaceObjectDiscoveryUnlocked;
+                        string repTag = !penaltiesEnabled ? "#SENTRY_frag_repPenaltyDisabled"
+                            : !discoveryUnlocked ? "#SENTRY_frag_repPenaltyLocked"
+                            : "#SENTRY_frag_repPenalty";
+                        message += " " + Localizer.Format(repTag, Math.Abs(report.WouldBeReputationDelta).ToString("F0"));
                         if (report.FacilityWouldBeDamaged)
                         {
                             // No funds figure quoted here (see the facility-application block
@@ -816,7 +936,7 @@ namespace Sentry
 
                         bool isCareer = HighLogic.CurrentGame != null && HighLogic.CurrentGame.Mode == Game.Modes.CAREER;
 
-                        if (isCareer && Reputation.Instance != null)
+                        if (isCareer && penaltiesEnabled && discoveryUnlocked && Reputation.Instance != null)
                         {
                             // This is NOT a softer,
                             // SENTRY-specific limit above that - a single bad enough chain of
@@ -864,7 +984,7 @@ namespace Sentry
                         // ImpactConsequence.Compute still computes WouldBeFundsDelta (harmless,
                         // unused, same "computed fact nothing reads" pattern already accepted for
                         // BypassesFloor) but nothing applies or reports it anymore.
-                        if (isCareer && report.FacilityWouldBeDamaged)
+                        if (isCareer && discoveryUnlocked && report.FacilityWouldBeDamaged)
                         {
                             if (report.FacilityDamageTier > pendingFacilityTier)
                             {
@@ -1012,6 +1132,9 @@ namespace Sentry
 
                 ThreatRecord rec;
                 records.TryGetValue(v.id, out rec);
+                // Backfill for records created before SpawnUT existed. Runs regardless of the cache
+                // check below, which would otherwise skip an unchanged object indefinitely.
+                if (rec != null && double.IsNaN(rec.SpawnUT) && !rec.Captured) rec.SpawnUT = ReadSpawnUT(v);
 
                 // A landed/splashed object has already resolved - see HandleLanded. Skip prediction
                 // entirely rather than let SoiIntersection.Predict run on a "landed" orbit, which KSP
@@ -1104,7 +1227,9 @@ namespace Sentry
             bool isNew = rec == null;
             if (isNew)
             {
-                rec = new ThreatRecord { VesselId = v.id, FirstSeenUT = now, State = ThreatState.Ignored };
+                rec = new ThreatRecord { VesselId = v.id, FirstSeenUT = now, SpawnUT = ReadSpawnUT(v), State = ThreatState.Ignored };
+                // A breakup fragment inherits its parent's comet type, but isn't a new discovery.
+                if (pendingFragmentIds.Remove(v.id)) rec.InterstellarAlertFired = true;
                 records[v.id] = rec;
             }
 
@@ -1116,19 +1241,6 @@ namespace Sentry
             if (result.EncounterFound) newState = result.IsImpact ? ThreatState.Impact : ThreatState.NearPass;
             else if (!double.IsNaN(approachDist)) newState = ThreatState.CloseApproach;
 
-            // Deflection-bonus dwell-time bookkeeping (mechanical, not part of the eligibility
-            // decision itself - see CheckDeflectionBonus below). Every FRESH entry into Impact
-            // restarts the clock; any exit clears it, so a later re-entry starts a brand new stint
-            // rather than reusing however long some earlier, unrelated stint had already run.
-            if (newState == ThreatState.Impact && oldState != ThreatState.Impact)
-            {
-                rec.ImpactStateEnteredUT = now;
-            }
-            else if (newState != ThreatState.Impact)
-            {
-                rec.ImpactStateEnteredUT = double.NaN;
-            }
-
             // Refresh everything we know.
             rec.Name = v.vesselName;
             rec.State = newState;
@@ -1138,6 +1250,8 @@ namespace Sentry
             rec.CapturePeA = result.CapturePeA;
             rec.Moid = result.MoidDistance;
             rec.IsGroundImpact = result.IsGroundImpact;
+            // Sticky, and only ever set while the rock is still undisturbed - see ThreatRecord.
+            if (result.IsGroundImpact && !rec.Captured && !IsDisturbed(v)) rec.WasNaturalImpactor = true;
             rec.GroundImpactUT = result.GroundImpactUT;
             rec.ClosestApproachDistance = approachDist;
             rec.ClosestApproachUT = approachUT;
@@ -1187,6 +1301,7 @@ namespace Sentry
             }
 
             string label = Describe(rec);
+            CheckInterstellarDiscovery(rec, label);
 
             // Keeps the stock Alarm Clock entry in sync with the current graze-vs-ground-impact
             // classification, independent of whether ThreatState itself just changed - a periapsis
@@ -1334,41 +1449,31 @@ namespace Sentry
         }
 
         // Deflection bonus - pays a positive reputation reward the first (and only the first) time
-        // a record's genuine, sustained Impact verdict resolves to a genuinely safe non-impact
-        // verdict. Called from ApplyResult right after rec's fields have already been refreshed for
-        // newState/result (rec.CapturePeA, rec.OrbitEpoch, etc. are the NEW values) but before the
-        // switch that would otherwise post a plain "All clear" notice for the same transition -
+        // an object that was once predicted to hit the ground ends up fully clear of the
+        // atmosphere. Called from ApplyResult on every evaluation, right after rec's fields have
+        // been refreshed for newState/result (rec.OrbitEpoch etc. are the NEW values) but before
+        // the switch that would otherwise post a plain "All clear" notice for the same transition -
         // return true to suppress that notice (this method posts its own alert instead) or false to
         // let it through unchanged (nothing paid, nothing to announce).
         //
-        // Per CLAUDE.md's "Deflection bonus and its exploit guard" design doc, and the owner's own
-        // 2026-09-27 simplification of it (no proximity/player-caused check needed - a rare
-        // gravity-assist "free" bonus is an acceptable cost, but a deflection must NEVER pay out
-        // more than once for the same object):
+        // Guards (no proximity/player-caused check, a rare
+        // gravity-assist "free" bonus is an acceptable cost):
         //
-        //   1. This must be a genuine exit from Impact, not a routine re-evaluation of something
-        //      that was never really Impact to begin with: oldState == ThreatState.Impact AND
-        //      newState != ThreatState.Impact.
+        //   1. rec.WasNaturalImpactor (sticky - see ThreatRecord) AND newState != ThreatState.Impact.
+        //      Impact means periapsis below the atmosphere, so this is "was once going to hit the
+        //      ground on its own, before the player ever touched it, and now clears the whole
+        //      atmosphere". A rock the player put on an impact course never qualifies. The atmosphere is the jitter buffer, and a
+        //      grazer that flies past as predicted never qualifies. Deliberately compares STATE, not
+        //      rec.CapturePeA: a rock burned clear of the SOI entirely has no capture orbit, its
+        //      CapturePeA is NaN, and NaN > anything is false.
         //   2. The orbit must have actually changed (oldEpoch, captured in ApplyResult before it
-        //      overwrote rec.OrbitEpoch, vs. v.orbit.epoch now) - ScanRoutine's own cache-hit check
-        //      (rec.OrbitEpoch == o.epoch) means ApplyResult CAN still run again with an unchanged
-        //      epoch purely because rec.ValidUntilUT expired (e.g. the "already inside SOI" branch
-        //      revalidates every single scan) - an epoch-unchanged exit from Impact is our own math
-        //      re-converging on a better answer, not a real deflection, and must not pay.
-        //   3. Minimum dwell: rec.ImpactStateEnteredUT (already maintained for you in ApplyResult -
-        //      set on every FRESH entry into Impact, cleared to NaN on every exit) must show this
-        //      stint lasted at least AdvancedSettings.DeflectionMinDwellSeconds before this exit.
-        //      Guards against a marginal object flickering in and out of Impact during ordinary
-        //      orbit refinement triggering (or re-triggering, once epoch happens to tick over) a
-        //      payout for a "deflection" that was never a sustained, real threat.
-        //   4. Post-deflection clearance margin: the NEW periapsis must clear the impact threshold
-        //      by a real margin, not just barely - rec.CapturePeA (already the new value) vs.
-        //      result.ThresholdAltitude + AdvancedSettings.DeflectionMinPeriapsisMarginM. A rock
-        //      nudged from 69 km to 71 km is not deflected.
-        //   5. Once-only: rec.HasPaidDeflection must be false, and must be set true the moment this
-        //      pays out - this is the core anti-farm guard (bonus once, penalty always).
+        //      overwrote rec.OrbitEpoch, vs. v.orbit.epoch now). Redundant on an atmospheric home
+        //      body (nothing jitters 70 km), but on an airless one the buffer shrinks to zero, and
+        //      this keeps our own math re-converging from looking like a deflection.
+        //   3. Once-only: rec.HasPaidDeflection must be false, and is set true the moment this pays
+        //      out - the core anti-farm guard (bonus once, penalty always).
         //
-        // If all five hold: compute a nominal "would-be" energy via
+        // If all three hold: compute a nominal "would-be" energy via
         // ImpactConsequence.TryEstimateNominalEnergyKt(rec) (the object's own class/real mass at a
         // fixed nominal impact speed - there's no live trajectory left to measure a precise speed
         // from once it's been redirected), convert to a bonus via
@@ -1386,26 +1491,30 @@ namespace Sentry
         private bool CheckDeflectionBonus(ThreatRecord rec, ThreatState oldState, ThreatState newState,
             double oldEpoch, EncounterResult result, Vessel v, double now, CelestialBody homeBody, string label)
         {
-            // TODO(human): split guard 4 out of the "moment of exit" check using
-            // rec.DeflectionAwaitingClearance (see its comment in ThreatRecord). A genuine exit that
-            // passes guards 1/2/3/5 but not 4 should set the flag instead of giving up; a later call
-            // (NearPass -> NearPass etc.) with the flag set pays out once guard 4 passes; and
-            // re-entering Impact should clear it.
             // I'm just gonna nest `if`s. There's probably a more efficient structure, but see note on C#.
             // Check 1
             string homeName = homeBody != null ? homeBody.name : "the home body";
-            if (oldState == ThreatState.Impact && newState != ThreatState.Impact)
+            if (rec.WasNaturalImpactor && newState != ThreatState.Impact)
             {
                 // Check 2
                 if (oldEpoch != v.orbit.epoch)
                 {
-                    // Check 3
-                    if (now - rec.ImpactStateEnteredUT > AdvancedSettings.DeflectionMinDwellSeconds)
-                    {
                         double bonus = 0;
                         // Check 5
                         if (!rec.HasPaidDeflection)
                         {
+                            // All three guards have passed: this is a genuine deflection. With
+                            // bonuses turned off it's still announced and still latched - only the
+                            // AddReputation call below is skipped, and the alert quotes the reputation
+                            // that would have been earned (same treatment as a disabled penalty in
+                            // ReportConfirmedImpact).
+                            bool bonusesEnabled = SentrySettings.DeflectionBonusesEnabled;
+                            // Same Tracking Station gate as the penalty side (SpaceObjectDiscoveryUnlocked).
+                            bool discoveryUnlocked = SpaceObjectDiscoveryUnlocked;
+                            string msgTag = !bonusesEnabled ? "#SENTRY_msg_deflectionSuccessNoRep"
+                                : !discoveryUnlocked ? "#SENTRY_msg_deflectionSuccessLocked"
+                                : "#SENTRY_msg_deflectionSuccess";
+
                             if (ImpactConsequence.TryEstimateNominalEnergyKt(rec, out double energyKt))
                             {
                                 bonus = ImpactConsequence.InterpolateDeflectionBonus(energyKt);
@@ -1428,7 +1537,7 @@ namespace Sentry
                                     {
                                         bonus = remainingBudget;
                                     }
-                                    if (bonus != 0)
+                                    if (bonus != 0 && bonusesEnabled && discoveryUnlocked)
                                     {
                                         // Last minute cast to `float`
                                         Reputation.Instance.AddReputation((float)bonus, TransactionReasons.None);
@@ -1437,15 +1546,14 @@ namespace Sentry
                                 rec.HasPaidDeflection = true;
                                 // I feel like someone piloting a vessel who redirects an asteroid might still want the screen notification with how much rep they earned since there are very few other occasions when a redirect might occur. I might have something wrong, though. Please push back if you disagree.
                                 // I probably messed the `AlertLog.Alert` syntax up
-                                AlertLog.Alert(Localizer.Format("#SENTRY_title_deflectionSuccess"), Localizer.Format("#SENTRY_msg_deflectionSuccess", label, homeName, bonus.ToString("F0")), severe: false, stopWarpEligible: false);
+                                AlertLog.Alert(Localizer.Format("#SENTRY_title_deflectionSuccess"), Localizer.Format(msgTag, label, homeName, bonus.ToString("F0")), severe: false, stopWarpEligible: false);
                                 return true;
                             }
                         }
                     }
                 }
+                return false;
             }
-            return false;
-        }
 
         private void HandleDisappearance(ThreatRecord rec, double now, CelestialBody homeBody)
         {

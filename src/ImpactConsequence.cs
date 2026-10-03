@@ -126,8 +126,23 @@ namespace Sentry
             // unrelated time under real physics the drag-free prediction never modeled. Preferring
             // rec.ImpactUT here would silently understate or overstate the lead-time-mitigation
             // credit for exactly the confirmed-impact case this field matters most for.
-            report.LeadTimeSeconds = state.UT - rec.FirstSeenUT;
-
+            // Mid-save install grace. rec.FirstSeenUT is when SENTRY first saw the object (so for
+            // a rock already inbound at install, the install moment); rec.SpawnUT is when stock
+            // spawned it - i.e. when the player could first have known, with or without SENTRY
+            // (NaN if unknown: captured records, or a vessel with no usable launchTime). A rock that
+            // predates the install is scored as if SENTRY had been watching since it spawned - fair,
+            // but only worth a few percent, since the mitigation curve barely moves under ~100 days.
+            // No full exemption, by the owner's choice: a window full of impactors with no
+            // consequence attached would read as SENTRY not working.
+            if (!double.IsNaN(rec.SpawnUT) && rec.SpawnUT < (SentryScenario.Instance != null ? SentryScenario.Instance.InstallUT : double.NaN))
+            {
+                report.LeadTimeSeconds = state.UT - rec.SpawnUT;
+            }
+            else
+            {
+                report.LeadTimeSeconds = state.UT - rec.FirstSeenUT;
+            }
+            
             // Still the nominal per-class radius even when RealMassKg overrode the mass above - the
             // real generated mesh's exact radius isn't read (would need more reflection into
             // ModuleAsteroid's private paGenerated field). Feeds the dispersion-length term in
@@ -359,7 +374,9 @@ namespace Sentry
         // change after load. Note ModuleComet does NOT derive from ModuleAsteroid (confirmed by
         // decompiling both - each extends PartModule directly with its own separate `density`
         // field), so the two are read independently rather than via a shared base type.
-        private static bool TryGetDensity(bool isComet, out double density)
+        // Internal (not private) so SentrySettings' density-patch status line can read the same
+        // values the consequence model actually uses.
+        internal static bool TryGetDensity(bool isComet, out double density)
         {
             if (isComet)
             {
@@ -414,8 +431,11 @@ namespace Sentry
         // Eqns A11-A18) in Collins et al. (2017), "A numerical assessment of simple airblast models
         // of impact airbursts," same journal. z* is the altitude where dynamic pressure first
         // exceeds material strength (breakup, ignoring the debris cloud's subsequent spread); the
-        // dispersion length l and the alpha threshold then push that down to the altitude of peak
-        // energy deposition, z_b - the "burst altitude" actually used for classification here.
+        // dispersion length l (A16) and the pancake factor f_p then push that down to z_b, where the
+        // debris cloud has spread to f_p times its original width - the "burst altitude" actually
+        // used for classification here. (The breakup criterion's 1/2 rho v^2 is unverified against
+        // the 2005 paper's eq. 11, which may use the full rho v^2 - a factor of 2 in effective
+        // strength, well inside the uncertainty of RubblePileStrengthPa itself.)
         private static (double burstAltitudeM, ConsequenceReport.Classification cls) BurstAltitude(
             double massKg, double bodyRadiusM, ImpactState state, CelestialBody home)
         {
@@ -478,8 +498,11 @@ namespace Sentry
 
             double l = 2.0 * bodyRadiusM * sinTheta * Math.Sqrt(rhoI / (cd * Math.Max(1e-12, rho0)))
                 * Math.Exp(zStar / (2.0 * h_));
-            double alpha = AdvancedSettings.BurstDispersionAlpha;
-            double zBurst = zStar - 2.0 * h_ * Math.Log(1.0 + (l / (2.0 * h_)) * Math.Sqrt(-Math.Log(alpha)));
+            // Altitude where the debris cloud has spread to f_p times its original width - see
+            // AdvancedSettings.PancakeFactor for the derivation. Clamped above 1 (f_p = 1 would mean
+            // "burst the instant it breaks up", and below that the square root is undefined).
+            double fp = Math.Max(1.0001, AdvancedSettings.PancakeFactor);
+            double zBurst = zStar - 2.0 * h_ * Math.Log(1.0 + (l / (2.0 * h_)) * Math.Sqrt(fp * fp - 1.0));
 
             if (zBurst <= 0.0)
             {
@@ -563,7 +586,7 @@ namespace Sentry
 
         // Derives the local exponential atmosphere scale height (P(h) = P(0) * exp(-h/H), so
         // H = (h2-h1) / ln(P1/P2)) from the ACTUAL home body's own pressure profile, rather than
-        // assuming Kerbin's ~5,600 m regardless of what body is actually loaded - CLAUDE.md's own
+        // assuming Kerbin's ~5,600 m regardless of what body is actually loaded - the
         // "never hardcode Kerbin, read FlightGlobals.GetHomeBody()" rule (see "Home world"), which
         // this constant was quietly violating for any planet pack (RSS, JNSQ, GPP, ...) that
         // changes the home body's atmosphere. Sampled at 0 and 30% of atmosphereDepth - well inside

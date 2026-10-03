@@ -35,6 +35,20 @@ namespace Sentry.UI
             ApplicationLauncher.AppScenes.SPACECENTER | ApplicationLauncher.AppScenes.TRACKSTATION
             | ApplicationLauncher.AppScenes.FLIGHT | ApplicationLauncher.AppScenes.MAPVIEW;
 
+        private const string IconLarge = "SENTRY/PluginData/Icons/icon-38";
+        private const string IconSmall = "SENTRY/PluginData/Icons/icon-24";
+        private const string IconLargeDanger = "SENTRY/PluginData/Icons/icon-38-danger";
+        private const string IconSmallDanger = "SENTRY/PluginData/Icons/icon-24-danger";
+
+        // The toolbar icon swaps to its red variant while any impactor's estimated reputation hit
+        // would show in red in the AlertWindow (AlertWindow.IsDangerous - one shared rule). Checked
+        // on a real-time timer rather than in the window's draw, because the icon has to stay
+        // accurate while the window is closed - that's exactly when it's useful. Once a second is
+        // plenty for something that changes on scan cadence, and costs a few orbit evaluations.
+        private const float DangerCheckIntervalRealSeconds = 1f;
+        private float nextDangerCheckRealtime;
+        private bool showingDangerIcon;
+
         private static AlertWindow sharedWindow;
         private ToolbarControl toolbarControl;
 
@@ -51,8 +65,20 @@ namespace Sentry.UI
                 sharedWindow.Show, sharedWindow.Hide,
                 RelevantScenes,
                 RegisterToolbar.ModId, "sentryButton",
-                "SENTRY/PluginData/Icons/icon-38", "SENTRY/PluginData/Icons/icon-24",
+                IconLarge, IconSmall,
                 "SENTRY");
+        }
+
+        private void Update()
+        {
+            if (toolbarControl == null || Time.realtimeSinceStartup < nextDangerCheckRealtime) return;
+            nextDangerCheckRealtime = Time.realtimeSinceStartup + DangerCheckIntervalRealSeconds;
+
+            bool danger = AlertWindow.AnyDangerousImpact(SentryScenario.Instance, FlightGlobals.GetHomeBody());
+            if (danger == showingDangerIcon) return; // only touch the texture on an actual change
+            showingDangerIcon = danger;
+            if (danger) toolbarControl.SetTexture(IconLargeDanger, IconSmallDanger);
+            else toolbarControl.SetTexture(IconLarge, IconSmall);
         }
 
         private void OnGUI()

@@ -360,6 +360,36 @@ namespace Sentry.UI
         // "this one is worth paying attention to", not tied to any actual game-state clamp.
         private const double DangerRepThreshold = 10.0;
 
+        // The single "is this estimate shown in red" rule - shared by the row color below and the
+        // toolbar icon's danger variant (SentryUI), so the two can never disagree. With reputation
+        // penalties off, or a Tracking Station too low to see space objects (no penalty is applied
+        // then either), nothing is ever red: the estimate is only what it would have cost.
+        public static bool IsDangerous(ConsequenceReport report)
+        {
+            return report.Valid
+                && SentrySettings.ReputationPenaltiesEnabled
+                && SentryScenario.SpaceObjectDiscoveryUnlocked
+                && Math.Abs(report.WouldBeReputationDelta) >= DangerRepThreshold;
+        }
+
+        // Same per-record eligibility and estimate as DrawContents uses for its rows (genuine
+        // ground impactors only - grazers never get an estimate), packaged for callers outside
+        // the window. Returns true if any record would currently show a red estimate.
+        public static bool AnyDangerousImpact(SentryScenario scenario, CelestialBody homeBody)
+        {
+            if (scenario == null || homeBody == null) return false;
+            foreach (ThreatRecord r in scenario.Records)
+            {
+                if (r.State != ThreatState.Impact || !r.IsGroundImpact) continue;
+                if (ImpactConsequence.TryGetPredictedState(r, homeBody, out ImpactState predicted)
+                    && IsDangerous(ImpactConsequence.Compute(r, predicted, homeBody)))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         // Diagnostic for the live estimate, which is otherwise never logged: prints every input the
         // number depends on the first time a record is estimated, and again only if the rep figure
         // moves by more than 25% - so a sudden jump is captured with its cause, without spamming.
@@ -402,7 +432,10 @@ namespace Sentry.UI
             if (estimate.HasValue)
             {
                 double repHit = Math.Abs(estimate.Value.WouldBeReputationDelta);
-                GUIStyle repStyle = repHit >= DangerRepThreshold ? dangerRepStyle : mildRepStyle;
+                // With penalties off the estimate is still shown (it's what the impact would have
+                // cost, matching the confirmed-impact report), but never in the red danger style -
+                // nothing will actually be charged.
+                GUIStyle repStyle = IsDangerous(estimate.Value) ? dangerRepStyle : mildRepStyle;
                 // Stock KSP has no loadable reputation icon file (its star glyph is baked into a
                 // Unity sprite atlas the compiled UI uses, not a loose GameData asset) - using the
                 // Unicode star character instead, since IMGUI just renders whatever the active font
